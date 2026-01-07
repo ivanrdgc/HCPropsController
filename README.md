@@ -160,8 +160,13 @@ Multiplicadores de los volúmenes = "1,1"
 
 El EA muestra un panel en el gráfico con toda la información importante:
 
-![Panel del HCPropsController](images/panel-example.png)
+**Modo MASTER:**
+![Panel del HCPropsController - Modo Master](images/panel-example.png)
 
+**Modo SLAVE:**
+![Panel del HCPropsController - Modo Slave](images/panel-example-slave.png)
+
+**Información mostrada:**
 - Estado de trading (HABILITADO/DESHABILITADO)
 - Límites configurados y estado actual
 - Trades abiertos hoy / máximo permitido
@@ -237,4 +242,4 @@ Si tienes problemas:
 ---
 
 **Versión**: 1.1
-**Última actualización**: 20245
+**Última actualización**: 2025

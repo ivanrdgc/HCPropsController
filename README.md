@@ -19,6 +19,8 @@ Ve a la sección [**Releases**](https://github.com/ivanrdgc/HCPropsController/re
 
 Si exportas Expert Advisors desde StrategyQuant (SQX), necesitas parchearlos para que respeten los límites del HCPropsController.
 
+![Interfaz del Parcheador - Paso 1](images/patch-1.png)
+
 ### Pasos Sencillos:
 
 1. **Descarga los archivos del parcheador**:
@@ -29,9 +31,13 @@ Si exportas Expert Advisors desde StrategyQuant (SQX), necesitas parchearlos par
 
 3. **Haz doble clic en `Ejecutar-Parcheador.bat`**
 
+![Interfaz del Parcheador - Opciones](images/patch-2.png)
+
 4. **Selecciona una opción**:
    - **Opción 1**: Procesar todos los archivos `.mq5` en una carpeta
    - **Opción 2**: Procesar un archivo individual
+
+![Interfaz del Parcheador - Resultado](images/patch-3.png)
 
 5. **Sigue las instrucciones en pantalla**
 
@@ -59,54 +65,60 @@ El EA controla los límites de riesgo y ejecuta operaciones en esta cuenta.
 
 **Parámetros Principales:**
 
-**Límites de Ganancia/Pérdida:**
-- `DailyProfitLimitPercent` - Límite diario de ganancia (%). Ejemplo: `4.6` = 4.6%
-- `DailyLossLimitPercent` - Límite diario de pérdida (%). Ejemplo: `4.6` = 4.6%
-- `TotalProfitLimitPercent` - Límite total de ganancia (%). Ejemplo: `8.1` = 8.1%
-- `TotalLossLimitPercent` - Límite total de pérdida (%). Ejemplo: `8.1` = 8.1%
+![Configuración del EA - Parámetros](images/ea-config-params.png)
+
+**=== CONFIGURACIÓN GENERAL ===**
+- `Modo de operación` - Selecciona `Master (ejecuta operaciones)` para este modo
+
+**=== LÍMITES DE EQUITY (Solo modo MASTER) ===**
+- `Límite diario de ganancia (%); 0 = no limitado` - Límite diario de ganancia. Ejemplo: `4.6` = 4.6%
+- `Límite diario de pérdida (%); 0 = no limitado` - Límite diario de pérdida. Ejemplo: `4.6` = 4.6%
+- `Límite total de ganancia (%); 0 = no limitado` - Límite total de ganancia. Ejemplo: `8.1` = 8.1%
+- `Límite total de pérdida (%); 0 = no limitado` - Límite total de pérdida. Ejemplo: `8.1` = 8.1%
 - **Nota**: Pon `0` para deshabilitar cualquier límite
 
-**Límites de Trading:**
-- `MaxParallelTrades` - Máximo de operaciones abiertas al mismo tiempo. Ejemplo: `1` = solo 1 operación
-- `MaxTradesPerDay` - Máximo de trades por día. Ejemplo: `1` = solo 1 trade al día
-- `MaxConsecWinsPerDay` - Máximo de ganancias consecutivas por día. Ejemplo: `0` = sin límite
-- `MaxConsecLosesPerDay` - Máximo de pérdidas consecutivas por día. Ejemplo: `0` = sin límite
+**=== LÍMITES DE TRADING (Solo modo MASTER) ===**
+- `Límite de operaciones paralelas; 0 = no limitado` - Máximo de operaciones abiertas al mismo tiempo. Ejemplo: `1` = solo 1 operación
+- `Límite de trades por día; 0 = no limitado` - Máximo de trades por día. Ejemplo: `1` = solo 1 trade al día
+- `Límite de pérdidas consecutivas por día; 0 = no limitado` - Máximo de pérdidas consecutivas. Ejemplo: `0` = sin límite
+- `Límite de ganancias consecutivas por día; 0 = no limitado` - Máximo de ganancias consecutivas. Ejemplo: `0` = sin límite
 - **Nota**: Pon `0` para deshabilitar cualquier límite
 
-**Reseteo Diario:**
-- `DailyResetHour` - Hora del reseteo diario (0-23). Ejemplo: `0` = medianoche
-- `DailyResetMinute` - Minuto del reseteo diario (0-59). Ejemplo: `0` = en punto
+**=== RESETEO DIARIO (Solo modo MASTER) ===**
+- `Hora de reseteo diario` - Hora del reseteo (0-23). Ejemplo: `0` = medianoche
+- `Minuto de reseteo diario` - Minuto del reseteo (0-59). Ejemplo: `0` = en punto
 
-**Horarios de Trading:**
-- `LimitTradingHours` - Activar límite de horarios. `true` = activado, `false` = desactivado
-- `TradingStartHour` - Hora de inicio (0-23). Ejemplo: `6` = 6:00 AM
-- `TradingStartMinute` - Minuto de inicio (0-59). Ejemplo: `0` = en punto
-- `TradingEndHour` - Hora de fin (0-23). Ejemplo: `20` = 8:00 PM
-- `TradingEndMinute` - Minuto de fin (0-59). Ejemplo: `0` = en punto
+**=== HORARIOS DE TRADING (Solo modo MASTER) ===**
+- `Limitar aperturas a las horas especificadas` - Activar límite de horarios. `true` = activado, `false` = desactivado
+- `Hora de inicio del trading` - Hora de inicio (0-23). Ejemplo: `6` = 6:00 AM
+- `Minuto de inicio del trading` - Minuto de inicio (0-59). Ejemplo: `0` = en punto
+- `Hora de fin del trading` - Hora de fin (0-23). Ejemplo: `20` = 8:00 PM
+- `Minuto de fin del trading` - Minuto de fin (0-59). Ejemplo: `0` = en punto
 
-**Cierre Forzado:**
-- `ForceExitHour` - Activar cierre forzado. `true` = activado, `false` = desactivado
-- `TradingExitHour` - Hora de cierre forzado (0-23). Ejemplo: `22` = 10:00 PM
-- `TradingExitMinute` - Minuto de cierre forzado (0-59). Ejemplo: `0` = en punto
+**=== CIERRE FORZADO (Solo modo MASTER) ===**
+- `Forzar cierre a la hora especificada` - Activar cierre forzado. `true` = activado, `false` = desactivado
+- `Hora de cierre forzado` - Hora de cierre (0-23). Ejemplo: `22` = 10:00 PM
+- `Minuto de cierre forzado` - Minuto de cierre (0-59). Ejemplo: `0` = en punto
 
 **Ejemplo de Configuración Típica:**
 ```
-DailyProfitLimitPercent = 4.6
-DailyLossLimitPercent = 4.6
-TotalProfitLimitPercent = 8.1
-TotalLossLimitPercent = 8.1
-MaxParallelTrades = 1
-MaxTradesPerDay = 1
-DailyResetHour = 0
-DailyResetMinute = 0
-LimitTradingHours = true
-TradingStartHour = 6
-TradingStartMinute = 0
-TradingEndHour = 20
-TradingEndMinute = 0
-ForceExitHour = true
-TradingExitHour = 22
-TradingExitMinute = 0
+Modo de operación = Master (ejecuta operaciones)
+Límite diario de ganancia (%) = 4.6
+Límite diario de pérdida (%) = 4.6
+Límite total de ganancia (%) = 8.1
+Límite total de pérdida (%) = 8.1
+Límite de operaciones paralelas = 1
+Límite de trades por día = 1
+Hora de reseteo diario = 0
+Minuto de reseteo diario = 0
+Limitar aperturas a las horas especificadas = true
+Hora de inicio del trading = 6
+Minuto de inicio del trading = 0
+Hora de fin del trading = 20
+Minuto de fin del trading = 0
+Forzar cierre a la hora especificada = true
+Hora de cierre forzado = 22
+Minuto de cierre forzado = 0
 ```
 
 #### 🔵 Modo SLAVE (Cuenta Replicadora)
@@ -115,24 +127,26 @@ El EA replica las operaciones de la cuenta MASTER de forma proporcional.
 
 **Parámetros Principales:**
 
-**Conexión al Master:**
-- `MasterServer` - Nombre exacto del servidor de la cuenta Master. **IMPORTANTE**: Debe coincidir exactamente, incluyendo espacios
-- `MasterAccountNumber` - Número de cuenta del Master
+**=== CONFIGURACIÓN GENERAL ===**
+- `Modo de operación` - Selecciona `Slave (replica operaciones)` para este modo
 
-**Opciones de Replicación:**
-- `RevertMasterPositions` - Invertir posiciones del Master. `true` = invertir (BUY→SELL), `false` = copiar igual
-- `MasterSymbolNames` - Símbolos del Master separados por coma. Ejemplo: `EURUSD,WS30`
-- `SlaveSymbolNames` - Símbolos del Slave correspondientes. Ejemplo: `EURUSD.pro,US30`
-- `SlaveSymbolMultipliers` - Multiplicadores de volumen separados por coma. Ejemplo: `0.1,1,10`
+**=== CONFIGURACIÓN SLAVE (Solo modo SLAVE) ===**
+- `Servidor de la cuenta Master` - Nombre exacto del servidor de la cuenta Master. **IMPORTANTE**: Debe coincidir exactamente, incluyendo espacios, mayúsculas y minúsculas
+- `Número de la cuenta Master` - Número de cuenta del Master. Ejemplo: `12345678`
+- `Invertir operaciones del Master` - Invertir posiciones del Master. `true` = invertir (BUY→SELL), `false` = copiar igual
+- `Símbolos Master (ej: EURUSD,WS30) - Opcional` - Símbolos del Master separados por coma. Ejemplo: `EURUSD,WS30`. Dejar vacío si no se necesita mapeo
+- `Símbolos Slave (ej: EURUSD.pro,US30) - Opcional` - Símbolos del Slave correspondientes. Ejemplo: `EURUSD.pro,US30`. Debe tener el mismo número de elementos que los símbolos Master
+- `Multiplicadores de los volúmenes (ej: 0.1,1,10) - Opcional` - Multiplicadores de volumen separados por coma. Ejemplo: `0.1,1,10`. Debe tener el mismo número de elementos que los símbolos Master
 
 **Ejemplo de Configuración:**
 ```
-MasterServer = "Mi Broker Demo"
-MasterAccountNumber = 12345678
-RevertMasterPositions = false
-MasterSymbolNames = "EURUSD,WS30"
-SlaveSymbolNames = "EURUSD.pro,US30"
-SlaveSymbolMultipliers = "1,1"
+Modo de operación = Slave (replica operaciones)
+Servidor de la cuenta Master = "Mi Broker Demo"
+Número de la cuenta Master = 12345678
+Invertir operaciones del Master = false
+Símbolos Master = "EURUSD,WS30"
+Símbolos Slave = "EURUSD.pro,US30"
+Multiplicadores de los volúmenes = "1,1"
 ```
 
 **Nota sobre Proporcionalidad:**
@@ -145,6 +159,8 @@ SlaveSymbolMultipliers = "1,1"
 ## 📊 Panel de Información
 
 El EA muestra un panel en el gráfico con toda la información importante:
+
+![Panel del HCPropsController](images/panel-example.png)
 
 - Estado de trading (HABILITADO/DESHABILITADO)
 - Límites configurados y estado actual
@@ -220,5 +236,5 @@ Si tienes problemas:
 
 ---
 
-**Versión**: 1.30  
-**Última actualización**: 2024
+**Versión**: 1.1
+**Última actualización**: 20245

@@ -25,6 +25,7 @@ enum HCMode
 //===================================================================
 input group "=== CONFIGURACIÓN GENERAL ==="
 input HCMode Mode = MODE_MASTER; // Modo de operación
+input double ForceInitialBalance = 0.0; // Forzar Balance Inicial (0 = detectar, >0 = usar este valor)
 
 //===================================================================
 // CONFIGURACIÓN SLAVE (Solo se usa en modo SLAVE)
@@ -355,6 +356,14 @@ int OnInit()
 //===================================================================
 void CalculateAccountDepositsAndWithdrawals()
 {
+   // Si se fuerza un balance inicial, usarlo directamente
+   if(ForceInitialBalance > 0.0)
+   {
+      AccountDepositsAndWithdrawals = ForceInitialBalance;
+      Print("AccountDepositsAndWithdrawals forzado: ", AccountDepositsAndWithdrawals);
+      return;
+   }
+   
    AccountDepositsAndWithdrawals = 0.0;
    
    // Seleccionar todo el historial de la cuenta desde el inicio
@@ -1945,10 +1954,11 @@ string GetPositionsCSVContent()
    CAccountInfo account;
    double accountDeposits = AccountDepositsAndWithdrawals;
    
-   // Si no hay depósitos, usar equity actual como referencia mínima
+   // Si no hay depósitos, usar balance actual como referencia (más estable que equity)
+   // El balance no cambia con ganancias/pérdidas flotantes, solo con operaciones cerradas
    if(accountDeposits <= 0)
    {
-      accountDeposits = account.Equity();
+      accountDeposits = account.Balance();
       if(accountDeposits <= 0)
          accountDeposits = 1.0; // Evitar división por cero
    }
@@ -2551,12 +2561,20 @@ void SlaveSync()
          continue;
       }
       
-      // Ajustar volumen si es distinto
+      // Ajustar volumen si es distinto (con tolerancia mejorada)
       double current = slaveVol[slavePosIdx];
       double diff = vol - current;
       double minVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+      double stepVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
       
-      if(MathAbs(diff) > 0.0000001)
+      // Calcular tolerancia: usar el mayor entre 1% del volumen actual y el step del símbolo
+      // Esto evita ajustes por diferencias insignificantes
+      double tolerance = MathMax(minVol * 0.01, stepVol);
+      if(tolerance <= 0)
+         tolerance = 0.0001; // Fallback si no se puede calcular
+      
+      // Solo ajustar si la diferencia es significativa (mayor que la tolerancia)
+      if(MathAbs(diff) > tolerance)
       {
          if(diff > 0)
          {
@@ -2573,7 +2591,6 @@ void SlaveSync()
          {
             // Reducir parcialmente
             double closeVol = MathAbs(diff);
-            double stepVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
             if(stepVol > 0)
                closeVol = MathFloor(closeVol / stepVol) * stepVol;
             

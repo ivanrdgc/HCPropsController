@@ -2459,7 +2459,73 @@ void SlaveSync()
    LastSlaveFileTime = fileModifyTime;
    
    // ---------------------------
-   // 2) Mapa de posiciones actuales del Slave
+   // 1b) Agregar posiciones del Master por símbolo (evitar múltiples ops por mismo par)
+   // ---------------------------
+   MasterPos masterAggregated[];
+   ArrayResize(masterAggregated, 0);
+   
+   for(int i = 0; i < ArraySize(masterList); i++)
+   {
+      string sym = masterList[i].symbol;
+      ENUM_POSITION_TYPE d = masterList[i].direction;
+      double v = masterList[i].volume;
+      
+      int idx = -1;
+      for(int j = 0; j < ArraySize(masterAggregated); j++)
+      {
+         if(masterAggregated[j].symbol == sym)
+         {
+            idx = j;
+            break;
+         }
+      }
+      
+      if(idx < 0)
+      {
+         int sz = ArraySize(masterAggregated);
+         ArrayResize(masterAggregated, sz + 1);
+         masterAggregated[sz].symbol = sym;
+         masterAggregated[sz].direction = d;
+         masterAggregated[sz].volume = v;
+      }
+      else
+      {
+         if(masterAggregated[idx].direction == d)
+            masterAggregated[idx].volume += v;
+         else
+         {
+            masterAggregated[idx].volume -= v;
+            if(masterAggregated[idx].volume < 0)
+            {
+               masterAggregated[idx].volume = -masterAggregated[idx].volume;
+               masterAggregated[idx].direction = d;
+            }
+         }
+      }
+   }
+   
+   // Filtrar entradas con volumen válido y respetar min/step por símbolo
+   MasterPos masterFinal[];
+   ArrayResize(masterFinal, 0);
+   for(int i = 0; i < ArraySize(masterAggregated); i++)
+   {
+      double minV = SymbolInfoDouble(masterAggregated[i].symbol, SYMBOL_VOLUME_MIN);
+      double stepV = SymbolInfoDouble(masterAggregated[i].symbol, SYMBOL_VOLUME_STEP);
+      double v = masterAggregated[i].volume;
+      if(stepV > 0)
+         v = MathFloor(v / stepV) * stepV;
+      v = MathMax(v, 0);
+      if(v >= minV)
+      {
+         int sz = ArraySize(masterFinal);
+         ArrayResize(masterFinal, sz + 1);
+         masterFinal[sz] = masterAggregated[i];
+         masterFinal[sz].volume = v;
+      }
+   }
+   
+   // ---------------------------
+   // 2) Mapa de posiciones actuales del Slave (agregadas por símbolo)
    // ---------------------------
    CPositionInfo pos;
    string slaveSymbols[];
@@ -2468,16 +2534,45 @@ void SlaveSync()
    
    for(int i = 0; i < PositionsTotal(); i++)
    {
-      if(pos.SelectByIndex(i))
+      if(!pos.SelectByIndex(i))
+         continue;
+      string sym = pos.Symbol();
+      ENUM_POSITION_TYPE d = pos.PositionType();
+      double v = pos.Volume();
+      
+      int idx = -1;
+      for(int j = 0; j < ArraySize(slaveSymbols); j++)
+      {
+         if(slaveSymbols[j] == sym)
+         {
+            idx = j;
+            break;
+         }
+      }
+      
+      if(idx < 0)
       {
          int sz = ArraySize(slaveSymbols);
          ArrayResize(slaveSymbols, sz + 1);
          ArrayResize(slaveDir, sz + 1);
          ArrayResize(slaveVol, sz + 1);
-         
-         slaveSymbols[sz] = pos.Symbol();
-         slaveDir[sz] = pos.PositionType();
-         slaveVol[sz] = pos.Volume();
+         slaveSymbols[sz] = sym;
+         slaveDir[sz] = d;
+         slaveVol[sz] = v;
+      }
+      else
+      {
+         if(slaveDir[idx] == d)
+            slaveVol[idx] += v;
+         else
+         {
+            slaveVol[idx] -= v;
+            if(slaveVol[idx] < 0)
+            {
+               slaveVol[idx] = -slaveVol[idx];
+               slaveDir[idx] = d;
+            }
+         }
       }
    }
    
@@ -2489,9 +2584,9 @@ void SlaveSync()
    for(int i = 0; i < ArraySize(slaveSymbols); i++)
    {
       bool found = false;
-      for(int j = 0; j < ArraySize(masterList); j++)
+      for(int j = 0; j < ArraySize(masterFinal); j++)
       {
-         if(masterList[j].symbol == slaveSymbols[i])
+         if(masterFinal[j].symbol == slaveSymbols[i])
          {
             found = true;
             break;
@@ -2499,20 +2594,26 @@ void SlaveSync()
       }
       if(!found)
       {
-         // Cerrar posición que el Master no tiene
-         if(pos.Select(slaveSymbols[i]))
+         // Cerrar todas las posiciones en este símbolo que el Master no tiene
+         for(int p = PositionsTotal() - 1; p >= 0; p--)
+         {
+            if(!pos.SelectByIndex(p))
+               continue;
+            if(pos.Symbol() != slaveSymbols[i])
+               continue;
             trade.PositionClose(pos.Ticket());
+         }
       }
    }
    
    // ---------------------------
-   // 4) Crear/ajustar posiciones según el Master
+   // 4) Crear/ajustar posiciones según el Master (una por símbolo, agregado)
    // ---------------------------
-   for(int i = 0; i < ArraySize(masterList); i++)
+   for(int i = 0; i < ArraySize(masterFinal); i++)
    {
-      string symbol = masterList[i].symbol;
-      ENUM_POSITION_TYPE dir = masterList[i].direction;
-      double vol = masterList[i].volume;
+      string symbol = masterFinal[i].symbol;
+      ENUM_POSITION_TYPE dir = masterFinal[i].direction;
+      double vol = masterFinal[i].volume;
       
       bool slaveHasPos = false;
       int slavePosIdx = -1;
@@ -2542,14 +2643,17 @@ void SlaveSync()
          continue;
       }
       
-      // Si la dirección difiere → cerrar y reabrir
+      // Si la dirección difiere → cerrar todas en este símbolo y reabrir
       if(slaveDir[slavePosIdx] != dir)
       {
-         // Siempre se puede cerrar
-         if(pos.Select(symbol))
+         for(int p = PositionsTotal() - 1; p >= 0; p--)
+         {
+            if(!pos.SelectByIndex(p))
+               continue;
+            if(pos.Symbol() != symbol)
+               continue;
             trade.PositionClose(pos.Ticket());
-         
-         // Reabrir
+         }
          double minVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
          if(vol >= minVol)
          {

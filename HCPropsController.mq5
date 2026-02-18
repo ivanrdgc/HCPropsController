@@ -455,6 +455,14 @@ void CalculateInitialEquityDaily()
    // (incluye profits, comisiones, swaps, depósitos, retiros, créditos, cargos, etc.)
    InitialEquityDaily = currentBalance - totalChangeAfterReset;
    
+   // Fallback: si la cuenta se financió hoy después del reseteo, el depósito inicial se cuenta como "cambio"
+   // y el resultado es 0. Usar balance actual como equity de inicio del día.
+   if(InitialEquityDaily <= 0.0 && currentBalance > 0.0 && AccountDepositsAndWithdrawals > 0.0)
+   {
+      InitialEquityDaily = currentBalance;
+      Print("InitialEquityDaily fallback: account funded after reset today");
+   }
+   
    Print("InitialEquityDaily calculado: ", InitialEquityDaily, " (Reset time: ", TimeToString(lastResetTime), ")");
 }
 
@@ -509,6 +517,14 @@ void CalculateInitialEquityDailySlave()
    // El balance al momento de medianoche = balance actual - todos los cambios después de medianoche
    // (incluye profits, comisiones, swaps, depósitos, retiros, créditos, cargos, etc.)
    InitialEquityDaily = currentBalance - totalChangeAfterMidnight;
+   
+   // Fallback: si la cuenta se financió hoy después de medianoche, el depósito inicial se cuenta como "cambio"
+   // y el resultado es 0. Usar balance actual como equity de inicio del día.
+   if(InitialEquityDaily <= 0.0 && currentBalance > 0.0 && AccountDepositsAndWithdrawals > 0.0)
+   {
+      InitialEquityDaily = currentBalance;
+      Print("InitialEquityDaily (SLAVE) fallback: account funded after midnight today");
+   }
    
    Print("InitialEquityDaily (SLAVE) calculado: ", InitialEquityDaily, " (Midnight: ", TimeToString(todayMidnight), ")");
 }

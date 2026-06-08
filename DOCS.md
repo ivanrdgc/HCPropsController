@@ -1,5 +1,60 @@
 # HCPropsController - Documentación Completa
 
+> ## ⚠️ Actualización v2.0 (autoritativa)
+>
+> Esta sección refleja el comportamiento **actual** del EA. Algunas partes del documento histórico
+> más abajo describen la versión 1.x (sizing proporcional, CSV de 3 campos) y están **superadas**.
+>
+> ### Arquitectura
+> - **Un solo EA** (`HCPropsController.mq5`) con `Mode = Master/Slave`. Incluye copy trading, guardián
+>   prop-firm y **filtro de noticias** integrado. Sin backend, sin login, sin licencia.
+> - Comunicación por archivo **CSV** en `Common\Files\HCPropsController\` (misma VPS). El nombre se
+>   toma de `FileName`/`CustomFilePath`, o se autogenera como `<base64(servidor_cuenta)>.csv`.
+>
+> ### Formato del archivo CSV (8 campos por posición, una línea por ticket del Master)
+> ```
+> ticket,symbol,type,volume,openPrice,sl,tp,openTime
+> ```
+> - `type`: 0 = BUY, 1 = SELL.  `volume`: lotes reales del Master.  `sl`/`tp`: precios.
+> - El Master solo reescribe cuando cambia algo (incluido SL/TP). El Slave solo lee si cambió la fecha de modificación.
+>
+> ### Sizing (Slave)
+> - `lote_slave = NormalizeVolume(volume_master × RiskMultiplier)` usando `CSymbolInfo`
+>   (LotsMin/Max/Step). **No** es proporcional al balance (eso era v1.x).
+>
+> ### Replicación (Slave, por ticket)
+> - Cada posición del Master se mapea a una posición del Slave mediante el comentario `HC<ticketMaster>`
+>   y el `MagicNumber`. El EA solo gestiona posiciones con su magic.
+> - `CopyMode = NORMAL` replica modificaciones de SL/TP (`PositionModify`); `INCOGNITO` solo al abrir.
+> - `InverseMode` invierte BUY/SELL e intercambia SL/TP.
+> - `SymbolMapping` usa formato `MAST:SLAV;MAST2:SLAV2`.
+> - Órdenes vía `CTrade` con `SetTypeFillingBySymbol` (modo de llenado correcto por broker),
+>   `SetDeviationInPoints(Slippage)` y `SetExpertMagicNumber(MagicNumber)`.
+> - Pensado para cuentas **hedging** (y el caso típico de 1 posición por símbolo por cuenta).
+>
+> ### Guardián (Master, solo si `PropFirmMode = true`)
+> - Límites diarios/totales de equity, max trades paralelos, max trades/día, rachas
+>   ganadoras/perdedoras, horario de trading, cierre forzado, reseteo diario configurable.
+> - **Persistencia** en GlobalVariables (`HCPropsController_*`): balance inicial, equity inicial diario,
+>   próximo reseteo y bloqueos. Sobrevive a reinicios/caídas de VPS.
+> - El **bloqueo total es pegajoso**: no se levanta solo aunque el equity se recupere; se libera con
+>   `ResetCountersOnInit = true`. El bloqueo **diario** se levanta en el reseteo diario.
+> - Señal de bloqueo compartida: GlobalVariable `HCPropsControllerDisableTrading` (la respetan los EA de SQX parcheados).
+>
+> ### Filtro de noticias (Master)
+> - Inputs: `NewsMode` (OPERATE/PAUSE_OPEN/CLOSE_ALL), `NewsDuration` (seg antes y después),
+>   `NewsCurrencies`, `NewsMinImpact`, `NewsSource` (MT5/URL), `NewsCalendarUrl`.
+> - Fuente por defecto: **calendario nativo MT5** (`CalendarValueHistory` + `CalendarEventById`),
+>   refrescado cada hora. Fallback `NEWS_SOURCE_URL` que lee un CSV `epoch,CURRENCY,impacto` por `WebRequest`.
+> - Verificación del calendario en el broker: ver `README.md` y el script `CheckCalendar.mq5`.
+>
+> ### Eliminado respecto a v1.x
+> - Sizing proporcional al balance y `SlaveSymbolMultipliers` (sustituidos por `RiskMultiplier`).
+> - CSV de 3 campos / dirección por signo (ahora 8 campos con `type` explícito).
+> - Listas paralelas `MasterSymbolNames`/`SlaveSymbolNames` (ahora `SymbolMapping` `key:value`).
+>
+> ---
+
 ## Tabla de Contenidos
 
 1. [HCPropsController.mq5 - Documentación Técnica](#hcpropscontrollermq5---documentación-técnica)

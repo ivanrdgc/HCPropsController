@@ -47,7 +47,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 ## Features at a Glance
 
 - **Prop-firm risk guardian** — daily and total profit/loss limits, max parallel trades, max trades per day, consecutive win/loss streak limits, trading-hours window, and a forced close time. When a limit is hit it closes positions, deletes pending orders, and disables trading.
-- **Copy trading** — replicate one MASTER account onto any number of SLAVE accounts on the same machine, with lot multiplier, symbol mapping, inverse mode, and a copy mode that optionally mirrors SL/TP changes.
+- **Copy trading** — replicate one MASTER account onto any number of SLAVE accounts on the same machine, with lot multiplier, symbol mapping, inverse mode, and distance-based SL/TP (measured from each account's own fill price).
 - **News filter** — pause or close trading around economic news using MT5's native economic calendar (fully offline).
 - **Live information panel** — an on-chart dashboard showing status, limits, counters, schedules, and connection state.
 - **Crash-safe** — risk state is persisted in MT5 Global Variables and survives EA restarts and VPS reboots.
@@ -205,7 +205,7 @@ A Slave links to its Master purely through the **`FileName`** in the `=== SYNC F
 |-----------|----------|---------|-------------|
 | Symbol mapping | `SymbolMapping` | `""` | Format `MASTER:SLAVE;MASTER2:SLAVE2`. E.g. `EURUSD:EURUSD.pro;US30:US30Cash`. Empty = same names. |
 | Copy mode | `CopyMode` | `NORMAL` | `NORMAL` also replicates SL/TP modifications; `INCOGNITO` sets SL/TP only at open and ignores later changes. |
-| Invert Master trades (and SL/TP) | `InverseMode` | `false` | `true` = trade the opposite direction (BUY→SELL) and swap SL/TP. |
+| Invert Master trades (and SL/TP) | `InverseMode` | `true` | `true` = trade the opposite direction (BUY→SELL) and mirror SL/TP around the entry. `false` = copy in the same direction. |
 | Lot multiplier | `RiskMultiplier` | `1.0` | Slave lot = Master lot × multiplier. `1.0` = same, `0.5` = half, `2.0` = double. |
 | Allowed slippage (points) | `Slippage` | `10` | Permitted deviation in points. |
 | Magic Number | `MagicNumber` | `987654` | Magic of the Slave's orders. Must be unique per Slave within the **same** terminal. The EA only manages positions carrying this magic. |
@@ -218,7 +218,7 @@ Operation mode        = Slave (replicates trades)
 File name             = master_00001.csv     (must match the Master)
 Symbol mapping        = "EURUSD:EURUSD.pro;US30:US30Cash"
 Copy mode             = NORMAL
-Invert Master trades  = false
+Invert Master trades  = true
 Lot multiplier        = 1.0
 Allowed slippage      = 10
 Magic Number          = 987654
@@ -275,8 +275,8 @@ One MASTER account broadcasts its open positions to any number of SLAVE accounts
 
 - **Per-ticket mapping.** Each Master position is mapped to a Slave position via the order comment `HC<masterTicket>` plus the Slave's `MagicNumber`. The Slave only ever manages positions carrying its own magic.
 - **Lot sizing.** `SlaveLot = NormalizeVolume(MasterLot × RiskMultiplier)`, clamped to the symbol's min/max/step. It is **not** proportional to balance — use `RiskMultiplier` to scale between accounts of different sizes.
-- **SL/TP replication.** `CopyMode = NORMAL` mirrors later SL/TP modifications; `INCOGNITO` fixes SL/TP only at open.
-- **Inverse trading.** `InverseMode = true` flips BUY↔SELL and swaps SL/TP.
+- **Distance-based SL/TP.** The Slave doesn't copy the Master's absolute SL/TP prices — it copies the **distance** from the Master's entry and applies it to its **own actual fill price**. So if the Master enters at 1.04500 with a stop 0.01000 away (1.05500) and the Slave fills at 1.04700 (slippage / different quotes), the Slave's stop is set at 1.05700 — the same distance, preserving the intended risk. `CopyMode = NORMAL` keeps re-applying this when the Master moves its SL/TP; `INCOGNITO` sets it only at open.
+- **Inverse trading.** `InverseMode = true` (the default) flips BUY↔SELL and **mirrors** SL/TP around the entry — the Master's TP distance becomes the Slave's SL, and vice versa.
 - **Symbol mapping.** Use `SymbolMapping` (`MAST:SLAV;MAST2:SLAV2`) when broker symbol names differ.
 - **Volume reduction tracking.** If the Master partially closes a position, the Slave reduces its volume to match (reduction only).
 - **Per-Slave profit cutoff.** `SlaveTotalProfitLimitPercent` closes everything and stops the Slave once reached.
@@ -437,13 +437,13 @@ The exit code is `1` if any file errored, `0` otherwise.
   ```
   ticket,symbol,type,volume,openPrice,sl,tp,openTime
   ```
-  where `type`: `0` = BUY, `1` = SELL; `volume` = the Master's real lots; `sl`/`tp` = prices.
+  where `type`: `0` = BUY, `1` = SELL; `volume` = the Master's real lots; `openPrice`/`sl`/`tp` = prices. The `openPrice` is what lets the Slave compute SL/TP as a distance from the Master's entry.
 - **Master writes** only when something changes (a content hash covering ticket, symbol, type, volume, SL, TP is compared each tick, and on every trade transaction). It also force-syncs immediately when a position opens or changes.
 - **Slave reads** only when the file's modification time changed since its last read, then reconciles its positions against the file:
   - closes Slave positions the Master no longer has,
   - reopens a position whose direction changed,
   - reduces volume to match a Master partial close,
-  - replicates SL/TP in `NORMAL` mode,
+  - sets/updates SL/TP as a distance from the Master's entry applied to the Slave's own fill price (re-applied each tick in `NORMAL` mode; set once at open in `INCOGNITO`),
   - opens any Master position it does not have yet (tagged with `HC<masterTicket>`).
 - **Disconnect detection:** the Master deletes its sync file on shutdown; the Slave then shows `WAITING FOR MASTER`.
 

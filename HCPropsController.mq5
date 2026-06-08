@@ -61,7 +61,7 @@ input string Symbols              = "";          // (MASTER) Symbols to replicat
 input group "=== SLAVE SETTINGS (SLAVE mode only) ==="
 input string     SymbolMapping       = "";        // Mapping MAST:SLAV;MAST2:SLAV2 (optional)
 input HCCopyMode CopyMode            = COPY_NORMAL;// Copy mode
-input bool       InverseMode         = false;     // Invert Master trades (and SL/TP)
+input bool       InverseMode         = true;      // Invert Master trades (reverse direction; mirror SL/TP)
 input double     RiskMultiplier      = 1.0;       // Lot multiplier (Slave lot = Master lot x mult)
 input int        Slippage            = 10;        // Allowed slippage (points)
 input long       MagicNumber         = 987654;    // Magic Number of the Slave orders
@@ -1106,8 +1106,10 @@ struct TargetPos
    string             symbol;     // symbol already mapped to the Slave
    ENUM_POSITION_TYPE dir;        // direction already inverted if applicable
    double             volume;     // normalized Slave lots
-   double             sl;
-   double             tp;
+   double             slDist;     // SL offset from the Master entry, applied to the Slave's own fill price
+   double             tpDist;     // TP offset from the Master entry, applied to the Slave's own fill price
+   bool               hasSL;
+   bool               hasTP;
    bool               matched;
   };
 
@@ -1134,6 +1136,33 @@ ulong ParseMasterTicketFromComment(string comment)
       return 0;
    string digits = StringSubstr(comment, pos + 2);
    return (ulong)StringToInteger(digits);
+  }
+
+// Set SL/TP on the just-opened Slave position, measured as a distance from its
+// ACTUAL fill price (so slippage / broker price differences don't change the stop distance).
+void ApplySlaveLevels(CTrade &trade, ulong masterTicket, ENUM_POSITION_TYPE dir,
+                      double slDist, double tpDist, bool hasSL, bool hasTP)
+  {
+   if(!hasSL && !hasTP)
+      return;
+   CPositionInfo p;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(!p.SelectByIndex(i))
+         continue;
+      if((long)p.Magic() != MagicNumber)
+         continue;
+      if(ParseMasterTicketFromComment(p.Comment()) != masterTicket || p.PositionType() != dir)
+         continue;
+      CSymbolInfo si; si.Name(p.Symbol());
+      int    dg    = (int)si.Digits();
+      double entry = p.PriceOpen();
+      double sl    = hasSL ? NormalizeDouble(entry + slDist, dg) : 0.0;
+      double tp    = hasTP ? NormalizeDouble(entry + tpDist, dg) : 0.0;
+      trade.SetTypeFillingBySymbol(p.Symbol());
+      trade.PositionModify(p.Ticket(), sl, tp);
+      return;
+     }
   }
 
 void SlaveSync()
@@ -1189,18 +1218,27 @@ void SlaveSync()
       ulong  mTicket = (ulong)StringToInteger(sTicket);
       int    mType   = (int)StringToInteger(sType);
       double mVol    = StringToDouble(sVol);
+      double mEntry  = StringToDouble(sOpen);   // Master entry: SL/TP are measured as distances from here
       double mSL     = StringToDouble(sSL);
       double mTP     = StringToDouble(sTP);
+
+      // SL/TP as signed distances from the Master's entry (broker/slippage-independent).
+      bool   hSL = (mSL != 0.0);
+      bool   hTP = (mTP != 0.0);
+      double dSL = hSL ? mSL - mEntry : 0.0;
+      double dTP = hTP ? mTP - mEntry : 0.0;
 
       string slaveSymbol = MapSymbol(sSymbol);
       ENUM_POSITION_TYPE mDir = (mType == 0) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
       ENUM_POSITION_TYPE sDir = mDir;
-      double sSLp = mSL, sTPp = mTP;
+      double slDist = dSL, tpDist = dTP;
+      bool   sHasSL = hSL, sHasTP = hTP;
       if(InverseMode)
         {
-         sDir = (mDir == POSITION_TYPE_BUY) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
-         sSLp = mTP; // swap SL/TP when inverting
-         sTPp = mSL;
+         // Mirror around the entry: the Master's TP distance becomes the Slave's SL, and vice versa.
+         sDir   = (mDir == POSITION_TYPE_BUY) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+         slDist = dTP; sHasSL = hTP;
+         tpDist = dSL; sHasTP = hSL;
         }
 
       double vol = NormalizeVolume(slaveSymbol, mVol * RiskMultiplier);
@@ -1213,8 +1251,10 @@ void SlaveSync()
       targets[sz].symbol  = slaveSymbol;
       targets[sz].dir     = sDir;
       targets[sz].volume  = vol;
-      targets[sz].sl      = sSLp;
-      targets[sz].tp      = sTPp;
+      targets[sz].slDist  = slDist;
+      targets[sz].tpDist  = tpDist;
+      targets[sz].hasSL   = sHasSL;
+      targets[sz].hasTP   = sHasTP;
       targets[sz].matched = false;
      }
    FileClose(h);
@@ -1281,13 +1321,15 @@ void SlaveSync()
            }
         }
 
-      // Replicate SL/TP in NORMAL mode
+      // Replicate SL/TP in NORMAL mode, measured from THIS position's own entry price.
       if(CopyMode == COPY_NORMAL)
         {
-         double pSL = pos.StopLoss();
-         double pTP = pos.TakeProfit();
-         if(MathAbs(pSL - targets[idx].sl) > si.Point() || MathAbs(pTP - targets[idx].tp) > si.Point())
-            trade.PositionModify(pos.Ticket(), targets[idx].sl, targets[idx].tp);
+         int    dg = (int)si.Digits();
+         double entry  = pos.PriceOpen();
+         double wantSL = targets[idx].hasSL ? NormalizeDouble(entry + targets[idx].slDist, dg) : 0.0;
+         double wantTP = targets[idx].hasTP ? NormalizeDouble(entry + targets[idx].tpDist, dg) : 0.0;
+         if(MathAbs(pos.StopLoss() - wantSL) > si.Point() || MathAbs(pos.TakeProfit() - wantTP) > si.Point())
+            trade.PositionModify(pos.Ticket(), wantSL, wantTP);
         }
      }
 
@@ -1316,12 +1358,16 @@ void SlaveSync()
       trade.SetTypeFillingBySymbol(sym);
       string comment = "HC" + IntegerToString((long)targets[t].masterTicket);
       bool ok;
+      // Open at market WITHOUT SL/TP first; they are set right after, measured from the real fill price.
       if(targets[t].dir == POSITION_TYPE_BUY)
-         ok = trade.Buy(targets[t].volume, sym, 0.0, targets[t].sl, targets[t].tp, comment);
+         ok = trade.Buy(targets[t].volume, sym, 0.0, 0.0, 0.0, comment);
       else
-         ok = trade.Sell(targets[t].volume, sym, 0.0, targets[t].sl, targets[t].tp, comment);
+         ok = trade.Sell(targets[t].volume, sym, 0.0, 0.0, 0.0, comment);
       if(!ok)
-         Print("SLAVE: error opening ", sym, " vol=", targets[t].volume, " ret=", trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(), ")");
+        { Print("SLAVE: error opening ", sym, " vol=", targets[t].volume, " ret=", trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(), ")"); continue; }
+
+      ApplySlaveLevels(trade, targets[t].masterTicket, targets[t].dir,
+                       targets[t].slDist, targets[t].tpDist, targets[t].hasSL, targets[t].hasTP);
      }
   }
 

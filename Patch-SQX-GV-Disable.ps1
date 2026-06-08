@@ -1,13 +1,13 @@
 # PowerShell script to patch SQX-exported MQL5 files to respect GV_DISABLE variable
 #
 # WAYS TO USE (from easiest to most advanced):
-#   1. Double-click "Ejecutar-Parcheador.bat" - Opens interactive graphical interface (RECOMMENDED)
+#   1. Double-click "Run-Patcher.bat" - Opens interactive graphical interface (RECOMMENDED)
 #   2. Drag a file/folder onto the script - Processes automatically
 #   3. Double-click this script (.ps1) - Opens interactive graphical interface
 #   4. From PowerShell: .\Patch-SQX-GV-Disable.ps1 -Path "C:\Path\To\Folder"
 #   5. From PowerShell: .\Patch-SQX-GV-Disable.ps1 -Path "C:\Path\To\File.mq5"
 #
-# NOTE: This script requires that "Ejecutar-Parcheador.bat" be in the same folder
+# NOTE: This script requires that "Run-Patcher.bat" be in the same folder
 #       if run via method 1.
 
 param(

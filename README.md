@@ -37,7 +37,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 |------|------|---------|
 | `HCPropsController.mq5` | Expert Advisor | The core EA: Master/Slave copy trading + prop-firm risk guardian + news filter, all in one. |
 | `CheckCalendar.mq5` | Script | Verifies that MT5's native economic calendar works on your broker (required for the news filter). |
-| `Patch-SQX-GV-Disable.ps1` + `Ejecutar-Parcheador.bat` | Windows tool | Patches EAs exported from StrategyQuant (SQX) so they obey HCPropsController's limits. |
+| `Patch-SQX-GV-Disable.ps1` + `Run-Patcher.bat` | Windows tool | Patches EAs exported from StrategyQuant (SQX) so they obey HCPropsController's limits. |
 | `patch-gv-disable.py` | Cross-platform tool | Same patcher as above, for Linux / macOS / any system with Python 3. |
 
 > **Everything is controlled from a single EA.** The news filter is built into `HCPropsController` (it is **not** a separate EA). No backend, login, or WebRequest is required for the default configuration.
@@ -406,8 +406,8 @@ A `.backup` copy of each file is created before it is modified. The patcher is *
 
 ![Patcher interface — step 1](images/patch-1.png)
 
-1. Keep `Ejecutar-Parcheador.bat` and `Patch-SQX-GV-Disable.ps1` **in the same folder**.
-2. Double-click **`Ejecutar-Parcheador.bat`**.
+1. Keep `Run-Patcher.bat` and `Patch-SQX-GV-Disable.ps1` **in the same folder**.
+2. Double-click **`Run-Patcher.bat`**.
 
 ![Patcher options](images/patch-2.png)
 

@@ -109,7 +109,7 @@ The EA reads the Master's shared file and replicates its positions. It does not 
 
 | Parameter | Variable | Default | Description |
 |-----------|----------|---------|-------------|
-| File name | `FileName` | `""` | Shared file name (empty = auto-generated from server + account number). The Slave must point at the same name. |
+| File name | `FileName` | `master_00001.csv` | Shared file name that links a Master to its Slave(s). The Slave must use the **same** value. For a second independent setup, bump the number (`master_00002.csv`, …) on both sides. |
 | Custom path | `CustomFilePath` | `""` | Custom path inside `Common\Files` (optional). |
 | Symbols | `Symbols` | `""` | (MASTER) Comma-separated symbols to replicate (empty = all). E.g. `EURUSD,US30`. |
 
@@ -199,12 +199,10 @@ Forced close                  = 22:00
 |-----------|----------|-------------|
 | Operation mode | `Mode` | Select `Slave (replicates trades)`. |
 
-#### === SLAVE SETTINGS (SLAVE only) ===
+A Slave links to its Master purely through the **`FileName`** in the `=== SYNC FILE ===` group — set it to the same value the Master uses (default `master_00001.csv`). No server/account configuration is needed.
 
 | Parameter | Variable | Default | Description |
 |-----------|----------|---------|-------------|
-| Master account server | `MasterServer` | `""` | Exact server name of the Master (only if `FileName` is empty). **Must match EXACTLY**, including spaces and case. |
-| Master account number | `MasterAccountNumber` | `0` | Master account number (only if `FileName` is empty). |
 | Symbol mapping | `SymbolMapping` | `""` | Format `MASTER:SLAVE;MASTER2:SLAVE2`. E.g. `EURUSD:EURUSD.pro;US30:US30Cash`. Empty = same names. |
 | Copy mode | `CopyMode` | `NORMAL` | `NORMAL` also replicates SL/TP modifications; `INCOGNITO` sets SL/TP only at open and ignores later changes. |
 | Invert Master trades (and SL/TP) | `InverseMode` | `false` | `true` = trade the opposite direction (BUY→SELL) and swap SL/TP. |
@@ -217,8 +215,7 @@ Forced close                  = 22:00
 
 ```
 Operation mode        = Slave (replicates trades)
-Master account server = "My Broker Demo"
-Master account number = 12345678
+File name             = master_00001.csv     (must match the Master)
 Symbol mapping        = "EURUSD:EURUSD.pro;US30:US30Cash"
 Copy mode             = NORMAL
 Invert Master trades  = false
@@ -227,7 +224,7 @@ Allowed slippage      = 10
 Magic Number          = 987654
 ```
 
-> **Tip:** You can point a Slave at the Master purely by `FileName` (both sides use the same name). In that case you do not need to fill in `MasterServer` / `MasterAccountNumber`.
+> **Linking Master ↔ Slave:** they are paired solely by `FileName`. Leave the default (`master_00001.csv`) on one Master and its Slave(s) and they connect with no further setup. For a second, independent Master/Slave group on the same machine, set both of its EAs to `master_00002.csv`, and so on.
 
 ---
 
@@ -323,9 +320,9 @@ The panel shows `NEWS ACTIVE: ...` in red during protection, and `News: watching
 
 The EA draws an on-chart dashboard with everything important. It only redraws the labels that changed, to avoid flicker.
 
-**MASTER panel shows:** mode (guardian on / sync only), server & account, trading status (ENABLED/DISABLED), active locks, initial balance, day-start equity, live equity with daily/total %, configured daily/total limits with color bands, trades today / parallel / win & loss streaks vs. their caps, the trading-hours window, news status, the next daily reset, and the forced-close time.
+**MASTER panel shows:** mode (guardian on / sync only), the sync **file** in use, trading status (ENABLED/DISABLED), active locks, initial balance, day-start equity, live equity with daily/total %, configured daily/total limits with color bands, trades today / parallel / win & loss streaks vs. their caps, the trading-hours window, news status, the next daily reset, and the forced-close time.
 
-**SLAVE panel shows:** mode, the Master it follows, Master account, invert/multiplier/copy-mode summary, connection status (CONNECTED / WAITING FOR MASTER), profit-lock state, and live equity.
+**SLAVE panel shows:** mode, the sync **file** it reads, invert/multiplier/copy-mode summary, connection status (CONNECTED / WAITING FOR MASTER), profit-lock state, and live equity.
 
 **Color coding (graded by how close you are to a limit):**
 
@@ -435,7 +432,7 @@ The exit code is `1` if any file errored, `0` otherwise.
 
 ## How Synchronization Works (Technical)
 
-- **Transport:** a CSV file in `Common\Files\HCPropsController\` on the same machine. The name comes from `FileName` / `CustomFilePath`, or is auto-generated as `<base64(server_account)>.csv`. Using the auto name lets multiple Masters coexist on one machine without clashing.
+- **Transport:** a CSV file in `Common\Files\HCPropsController\` on the same machine, named by `FileName` (or a full path via `CustomFilePath`). The Master writes it and its Slave(s) read it — they're linked by using the same `FileName`. Run multiple independent groups on one machine by giving each its own file name (`master_00001.csv`, `master_00002.csv`, …).
 - **CSV format** — one line per Master ticket, 8 comma-separated fields:
   ```
   ticket,symbol,type,volume,openPrice,sl,tp,openTime
@@ -472,8 +469,8 @@ A: It uses MT5's native calendar (no backend, login, or network requests). Confi
 **Q: What does "0 = no limit" mean?**
 A: Setting `0` on any limit disables that limit entirely.
 
-**Q: How do I find my exact server name for SLAVE mode?**
-A: In MT5, **Tools → Options → Server**, and copy the name exactly — it must match the Master's character-for-character (case and spaces included). Or just use `FileName` on both sides to avoid the issue.
+**Q: How does a Slave know which Master to follow?**
+A: Purely by `FileName` — set the Slave's `FileName` to the same value as its Master (default `master_00001.csv`). No server name or account number is involved.
 
 ---
 
@@ -493,7 +490,7 @@ A: In MT5, **Tools → Options → Server**, and copy the name exactly — it mu
 If you run into issues:
 
 1. Check the **Experts** and **Journal** tabs in MetaTrader 5 for messages.
-2. Verify all parameters are set correctly (especially the Master/Slave linking — `FileName`, or server + account number).
+2. Verify all parameters are set correctly (especially the Master/Slave linking — both must use the same `FileName`).
 3. Make sure files are in the correct folders and the EAs are compiled.
 4. For news, run `CheckCalendar.mq5` to confirm the calendar is available.
 

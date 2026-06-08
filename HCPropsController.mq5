@@ -54,13 +54,11 @@ input double ForceInitialBalance  = 0.0;         // Force initial balance (0 = a
 input bool   ResetCountersOnInit  = false;       // Reset counters and locks on init (MASTER only)
 
 input group "=== SYNC FILE ==="
-input string FileName             = "";          // File name (empty = auto from server+account)
-input string CustomFilePath       = "";          // Custom path inside Common\Files (optional)
+input string FileName             = "master_00001.csv"; // Shared file name (Master and Slave must match; bump 00001 for more)
+input string CustomFilePath       = "";          // Custom path inside Common\Files (overrides FileName)
 input string Symbols              = "";          // (MASTER) Symbols to replicate, comma-sep (empty = all)
 
 input group "=== SLAVE SETTINGS (SLAVE mode only) ==="
-input string     MasterServer        = "";        // Master account server (if FileName is empty)
-input long       MasterAccountNumber = 0;         // Master account number (if FileName is empty)
 input string     SymbolMapping       = "";        // Mapping MAST:SLAV;MAST2:SLAV2 (optional)
 input HCCopyMode CopyMode            = COPY_NORMAL;// Copy mode
 input bool       InverseMode         = false;     // Invert Master trades (and SL/TP)
@@ -192,22 +190,6 @@ struct SyncPos
 //+------------------------------------------------------------------+
 //| String utilities                                                 |
 //+------------------------------------------------------------------+
-string ReplaceString(string text, string search, string replace)
-  {
-   string result = text;
-   StringReplace(result, search, replace);
-   return result;
-  }
-
-string NormalizeServerName(string serverName)
-  {
-   StringTrimLeft(serverName);
-   StringTrimRight(serverName);
-   while(StringFind(serverName, "  ") >= 0)
-      StringReplace(serverName, "  ", " ");
-   return serverName;
-  }
-
 // Is 'symbol' in the CSV 'list'? (empty list = all)
 bool SymbolInList(string symbol, string list)
   {
@@ -226,52 +208,21 @@ bool SymbolInList(string symbol, string list)
   }
 
 //+------------------------------------------------------------------+
-//| BASE64 for file name (auto fallback)                             |
+//| Sync file path (relative to Common\Files)                        |
 //+------------------------------------------------------------------+
-string Base64Encode(string data)
-  {
-   uchar src[], key[], dst[];
-   StringToCharArray(data, src, 0, StringLen(data));
-   ArrayResize(key, 0);
-   int res = CryptEncode(CRYPT_BASE64, src, key, dst);
-   if(res > 0)
-     {
-      string encoded = CharArrayToString(dst);
-      encoded = ReplaceString(encoded, "\r\n", "");
-      encoded = ReplaceString(encoded, "\n", "");
-      encoded = ReplaceString(encoded, "\r", "");
-      return encoded;
-     }
-   string safe = data;
-   string repl[] = {"\\","/",":","*","?","\"","<",">","|"};
-   for(int i = 0; i < ArraySize(repl); i++)
-      safe = ReplaceString(safe, repl[i], "_");
-   return safe;
-  }
-
-//+------------------------------------------------------------------+
-//| File paths (relative to Common\Files)                            |
-//+------------------------------------------------------------------+
-// Returns the file path for a given server/account.
-string BuildFilePath(string server, long account)
+// The shared file is identified purely by FileName (or CustomFilePath).
+// Master and Slave use the same value, so both resolve to the same file.
+string GetSyncFilePath()
   {
    if(CustomFilePath != "")
       return CustomFilePath;
-   if(FileName != "")
-      return HCPROPS_KEY + "\\" + FileName;
-   string enc = Base64Encode(NormalizeServerName(server) + "_" + IntegerToString(account));
-   return HCPROPS_KEY + "\\" + enc + ".csv";
+   return HCPROPS_KEY + "\\" + FileName;
   }
 
-string GetMyFilePath()       // Master: its own file
+// Human-friendly name for the panel.
+string SyncFileLabel()
   {
-   CAccountInfo acc;
-   return BuildFilePath(acc.Server(), acc.Login());
-  }
-
-string GetMasterFilePath()   // Slave: the Master's file
-  {
-   return BuildFilePath(MasterServer, MasterAccountNumber);
+   return (CustomFilePath != "") ? CustomFilePath : FileName;
   }
 
 //===================================================================
@@ -297,14 +248,12 @@ int OnInit()
         { Print("ERROR: NewsDuration must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
      }
 
-   // SLAVE validation: needs either FileName/CustomFilePath, or server+account
+   // SLAVE validation: needs a shared file name to read from
    if(Mode == MODE_SLAVE)
      {
-      bool hasFile   = (FileName != "" || CustomFilePath != "");
-      bool hasServer = (MasterServer != "" && MasterAccountNumber != 0);
-      if(!hasFile && !hasServer)
+      if(FileName == "" && CustomFilePath == "")
         {
-         Print("ERROR: In SLAVE mode set FileName/CustomFilePath, or MasterServer + MasterAccountNumber");
+         Print("ERROR: In SLAVE mode set FileName (must match the Master's FileName), or CustomFilePath");
          return INIT_PARAMETERS_INCORRECT;
         }
      }
@@ -395,14 +344,14 @@ int OnInit()
      }
    else
      {
-      string rel = GetMasterFilePath();
+      string rel = GetSyncFilePath();
       MasterFileExists = FileIsExist(rel, FILE_COMMON);
       if(MasterFileExists)
          Print("SLAVE: Master file found: ", rel);
       else
         {
          Print("SLAVE: Master file NOT found on start: ", rel);
-         Print("SLAVE: check FileName, or that MasterServer matches EXACTLY (including spaces).");
+         Print("SLAVE: check that FileName matches the Master's FileName exactly.");
          SlaveWarningShown = true;
         }
      }
@@ -1104,7 +1053,7 @@ string PositionsHash()
 
 bool WriteSyncFile()
   {
-   string rel = GetMyFilePath();
+   string rel = GetSyncFilePath();
 
    // Ensure folder (Common\Files\HCPropsController)
    ResetLastError();
@@ -1192,7 +1141,7 @@ void SlaveSync()
    if(Mode != MODE_SLAVE)
       return;
 
-   string rel = GetMasterFilePath();
+   string rel = GetSyncFilePath();
 
    if(!FileIsExist(rel, FILE_COMMON))
      {
@@ -1480,8 +1429,7 @@ void UpdateDashboard()
    CreateOrUpdateLabel("HCProps_Title", 20, y, "=== HC Props Controller ===", clrDodgerBlue, 12, true, 0); y += lh + 5;
    string modeText = PropFirmMode ? "MASTER (guardian ON)" : "MASTER (sync only)";
    CreateOrUpdateLabel("HCProps_Mode", 20, y, "Mode: " + modeText, clrYellow, 11, true, 1); y += lh + 3;
-   CreateOrUpdateLabel("HCProps_Server", 20, y, "Server: " + acc.Server(), clrAqua, 10, false, 2); y += lh;
-   CreateOrUpdateLabel("HCProps_Account", 20, y, "Account: " + IntegerToString(acc.Login()), clrAqua, 10, false, 3); y += lh + 5;
+   CreateOrUpdateLabel("HCProps_File", 20, y, "File: " + SyncFileLabel(), clrAqua, 10, false, 2); y += lh + 5;
 
    string status = TradingIsDisabled() ? "DISABLED" : "ENABLED";
    CreateOrUpdateLabel("HCProps_Status", 20, y, "Trading Status: " + status, TradingIsDisabled() ? clrRed : clrLime, 11, true, 4); y += lh;
@@ -1491,7 +1439,7 @@ void UpdateDashboard()
    else if(NewsMode != NEWS_OPERATE)
      { CreateOrUpdateLabel("HCProps_News", 20, y, "News: watching (" + IntegerToString(ArraySize(g_newsTimes)) + ")", clrLime, 9, false, 5); y += lh; }
    else
-     { CreateOrUpdateLabel("HCProps_News", 20, y, "", clrLime, 9, false, 5); }
+     { ObjectDelete(0, "HCProps_News"); LastDashboardValues[5] = ""; } // OPERATE: no news line (don't stack an empty label on "Locks:")
 
    if(PropFirmMode)
      {
@@ -1555,6 +1503,7 @@ void UpdateDashboard()
 
    SizePanel(y);
    DashboardNeedsUpdate = false;
+   ChartRedraw(0);
   }
 
 void UpdateDashboardSlave()
@@ -1563,15 +1512,14 @@ void UpdateDashboardSlave()
    int y = 20, lh = 20;
    CreateOrUpdateLabel("HCProps_Title", 20, y, "=== HC Props Controller ===", clrDodgerBlue, 12, true, 0); y += lh + 5;
    CreateOrUpdateLabel("HCProps_Mode", 20, y, "Mode: SLAVE", clrYellow, 11, true, 1); y += lh + 3;
-   CreateOrUpdateLabel("HCProps_MS", 20, y, "Master: " + (FileName != "" ? FileName : MasterServer), clrAqua, 10, false, 2); y += lh;
-   CreateOrUpdateLabel("HCProps_MA", 20, y, "Master Account: " + IntegerToString(MasterAccountNumber), clrAqua, 10, false, 3); y += lh;
+   CreateOrUpdateLabel("HCProps_File", 20, y, "File: " + SyncFileLabel(), clrAqua, 10, false, 2); y += lh;
    CreateOrUpdateLabel("HCProps_Rev", 20, y, "Invert: " + (InverseMode ? "YES" : "NO") + " | Mult: " + DoubleToString(RiskMultiplier, 2) + " | " + (CopyMode == COPY_NORMAL ? "NORMAL" : "INCOGNITO"), clrAqua, 9, false, 4); y += lh + 5;
    string st = MasterFileExists ? "CONNECTED" : "WAITING FOR MASTER";
    CreateOrUpdateLabel("HCProps_MStatus", 20, y, "Master Status: " + st, MasterFileExists ? clrLime : clrOrange, 11, true, 5); y += lh;
    if(SlaveProfitLocked)
      { CreateOrUpdateLabel("HCProps_SLock", 20, y, "PROFIT LOCK: replication stopped", clrRed, 10, true, 6); y += lh; }
    else
-     { CreateOrUpdateLabel("HCProps_SLock", 20, y, "", clrLime, 9, false, 6); }
+     { ObjectDelete(0, "HCProps_SLock"); LastDashboardValues[6] = ""; } // no empty label stacked on "Equity:"
    CreateOrUpdateLabel("HCProps_SEq", 20, y, "Equity: " + DoubleToString(acc.Equity(), 2), clrWhite, 10, false, 7); y += lh;
    SizePanel(y);
    DashboardNeedsUpdate = false;
@@ -1603,7 +1551,7 @@ void OnDeinit(const int reason)
      {
       // We do not force EnableTrading here to avoid lifting a limit lock on a mere recompile.
       // Delete the sync file so Slaves detect the disconnection.
-      string rel = GetMyFilePath();
+      string rel = GetSyncFilePath();
       if(FileIsExist(rel, FILE_COMMON))
          FileDelete(rel, FILE_COMMON);
 

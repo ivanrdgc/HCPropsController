@@ -44,12 +44,6 @@ enum HCNewsImpact
    NEWS_IMP_HIGH     = 3  // High impact only
   };
 
-enum HCNewsSource
-  {
-   NEWS_SOURCE_MT5 = 0, // Native MetaTrader 5 calendar (recommended)
-   NEWS_SOURCE_URL = 1  // Custom CSV feed via WebRequest
-  };
-
 //===================================================================
 // INPUT PARAMETERS
 //===================================================================
@@ -108,8 +102,6 @@ input HCNewsMode   NewsMode       = NEWS_OPERATE;   // News handling mode
 input int          NewsDuration   = 120;            // Protection before and after (seconds)
 input string       NewsCurrencies = "";             // Currencies to watch (e.g. EUR,USD,GBP); empty = chart symbol
 input HCNewsImpact NewsMinImpact  = NEWS_IMP_HIGH;  // Minimum impact to consider
-input HCNewsSource NewsSource     = NEWS_SOURCE_MT5;// Calendar source
-input string       NewsCalendarUrl= "";             // (NEWS_SOURCE_URL) CSV feed URL "epoch,CURRENCY,impact"
 
 //===================================================================
 // GLOBAL VARIABLES (keys)
@@ -801,48 +793,6 @@ void FetchNewsMT5(datetime from, datetime to, string &curr[])
      }
   }
 
-void FetchNewsUrl(datetime from, datetime to, string &curr[])
-  {
-   if(NewsCalendarUrl == "")
-      return;
-   char post[], result[];
-   string headers;
-   ResetLastError();
-   int code = WebRequest("GET", NewsCalendarUrl, "", "", 5000, post, 0, result, headers);
-   if(code != 200)
-     {
-      Print("NEWS(URL): WebRequest returned ", code, " err=", GetLastError(), " (is the URL in the allowed list?)");
-      return;
-     }
-   string body = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
-   string lines[];
-   int nl = StringSplit(body, '\n', lines);
-   for(int i = 0; i < nl; i++)
-     {
-      string line = lines[i];
-      line = ReplaceString(line, "\r", "");
-      if(StringLen(line) < 5)
-         continue;
-      string f[];
-      if(StringSplit(line, ',', f) < 3)
-         continue;
-      datetime t = (datetime)StringToInteger(f[0]);
-      string cy = f[1]; StringTrimLeft(cy); StringTrimRight(cy);
-      int imp = (int)StringToInteger(f[2]);
-      if(t < from || t > to || imp < (int)NewsMinImpact)
-         continue;
-      bool wanted = false;
-      for(int c = 0; c < ArraySize(curr); c++) if(curr[c] == cy) { wanted = true; break; }
-      if(!wanted)
-         continue;
-      int sz = ArraySize(g_newsTimes);
-      ArrayResize(g_newsTimes, sz + 1);
-      ArrayResize(g_newsCurr,  sz + 1);
-      ArrayResize(g_newsName,  sz + 1);
-      g_newsTimes[sz] = t; g_newsCurr[sz] = cy; g_newsName[sz] = "URL";
-     }
-  }
-
 void FetchNews()
   {
    ArrayResize(g_newsTimes, 0);
@@ -858,10 +808,7 @@ void FetchNews()
    datetime from = LastResetAnchor() - 86400;
    datetime to   = TimeCurrent() + 2 * 86400;
 
-   if(NewsSource == NEWS_SOURCE_MT5)
-      FetchNewsMT5(from, to, curr);
-   else
-      FetchNewsUrl(from, to, curr);
+   FetchNewsMT5(from, to, curr);
 
    Print("NEWS: ", ArraySize(g_newsTimes), " news scheduled (impact>=", (int)NewsMinImpact, ")");
   }

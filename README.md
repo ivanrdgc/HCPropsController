@@ -40,7 +40,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 | `Patch-SQX-GV-Disable.ps1` + `Run-Patcher.bat` | Windows tool | Patches EAs exported from StrategyQuant (SQX) so they obey HCPropsController's limits. |
 | `patch-gv-disable.py` | Cross-platform tool | Same patcher as above, for Linux / macOS / any system with Python 3. |
 
-> **Everything is controlled from a single EA.** The news filter is built into `HCPropsController` (it is **not** a separate EA). No backend, login, or WebRequest is required for the default configuration.
+> **Everything is controlled from a single EA.** The news filter is built into `HCPropsController` (it is **not** a separate EA). No backend, login, or `WebRequest` is required — the EA runs entirely offline.
 
 ---
 
@@ -48,7 +48,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 
 - **Prop-firm risk guardian** — daily and total profit/loss limits, max parallel trades, max trades per day, consecutive win/loss streak limits, trading-hours window, and a forced close time. When a limit is hit it closes positions, deletes pending orders, and disables trading.
 - **Copy trading** — replicate one MASTER account onto any number of SLAVE accounts on the same machine, with lot multiplier, symbol mapping, inverse mode, and a copy mode that optionally mirrors SL/TP changes.
-- **News filter** — pause or close trading around economic news using MT5's native economic calendar (offline), or a custom CSV feed.
+- **News filter** — pause or close trading around economic news using MT5's native economic calendar (fully offline).
 - **Live information panel** — an on-chart dashboard showing status, limits, counters, schedules, and connection state.
 - **Crash-safe** — risk state is persisted in MT5 Global Variables and survives EA restarts and VPS reboots.
 - **SQX integration** — a patcher that makes StrategyQuant EAs stop trading whenever HCPropsController blocks trading.
@@ -80,11 +80,9 @@ Go to the [**Releases**](https://github.com/ivanrdgc/HCPropsController/releases)
 1. Copy `HCPropsController.mq5` into the `MQL5/Experts/` folder of your MetaTrader 5.
 2. Restart MetaTrader 5 or refresh the Navigator (F5), then compile the EA in MetaEditor (F7).
 3. Drag the EA onto a chart.
-4. In **Tools → Options → Expert Advisors**, allow algorithmic trading. (Only needed for the URL news source: add the feed URL under "Allow WebRequest for listed URL".)
+4. In **Tools → Options → Expert Advisors**, allow algorithmic trading. (No `WebRequest` whitelist is needed — the EA never makes network requests.)
 
 ### The Two Operating Modes
-
-![EA configuration parameters](images/ea-config-params.png)
 
 #### 🔴 MASTER mode (primary account)
 
@@ -171,8 +169,6 @@ See the dedicated [News Filter](#feature-news-filter) section for full details.
 | Protection before and after (seconds) | `NewsDuration` | `120` | Half-window in seconds around each event. |
 | Currencies to watch | `NewsCurrencies` | `""` | E.g. `EUR,USD,GBP`. Empty = derive from the chart symbol. |
 | Minimum impact to consider | `NewsMinImpact` | `HIGH` | `LOW` / `MODERATE` / `HIGH`. |
-| Calendar source | `NewsSource` | `MT5` | `MT5` (native calendar) or `URL` (custom CSV feed). |
-| CSV feed URL | `NewsCalendarUrl` | `""` | Only for `NewsSource = URL`. |
 
 #### Typical MASTER configuration
 
@@ -309,8 +305,6 @@ Built into MASTER mode. The EA can pause or close trading around economic news u
 - `NewsDuration` — seconds of protection **before and after** each event. E.g. `120` → protection from 2 min before to 2 min after (a 4-minute window).
 - `NewsCurrencies` — uppercase, no spaces: `EUR,USD,GBP`. If left **empty**, the EA uses the base + profit currency of the chart symbol.
 - `NewsMinImpact` — `LOW` / `MODERATE` / `HIGH` (default **HIGH**, high-impact events only).
-- `NewsSource` — `MT5` (native calendar, recommended) or `URL` (custom feed).
-- `NewsCalendarUrl` — only for `NewsSource = URL`: a CSV with lines `epoch,CURRENCY,impact` (1=Low, 2=Moderate, 3=High).
 
 ### How it works
 
@@ -321,21 +315,13 @@ Built into MASTER mode. The EA can pause or close trading around economic news u
 
 The panel shows `NEWS ACTIVE: ...` in red during protection, and `News: watching (N)` the rest of the time.
 
-For the **URL** source, add the feed URL under **Tools → Options → Expert Advisors → Allow WebRequest for listed URL**.
+> The news filter reads only MT5's **native** economic calendar — no network requests, no external feeds. Because calendar access from MQL5 is **per-broker**, verify it works on your broker with [CheckCalendar](#tool-calendar-checker-checkcalendar) before relying on it.
 
 ---
 
 ## Feature: Information Panel
 
 The EA draws an on-chart dashboard with everything important. It only redraws the labels that changed, to avoid flicker.
-
-**MASTER mode:**
-
-![Panel — Master mode](images/panel-example.png)
-
-**SLAVE mode:**
-
-![Panel — Slave mode](images/panel-example-slave.png)
 
 **MASTER panel shows:** mode (guardian on / sync only), server & account, trading status (ENABLED/DISABLED), active locks, initial balance, day-start equity, live equity with daily/total %, configured daily/total limits with color bands, trades today / parallel / win & loss streaks vs. their caps, the trading-hours window, news status, the next daily reset, and the forced-close time.
 
@@ -385,7 +371,7 @@ The economic calendar is delivered by **MetaQuotes**, not your broker, but some 
 
 **Requirement:** the terminal must be **connected** to a trading server (the calendar syncs from there). In the Strategy Tester the calendar may be limited on older builds.
 
-**If your broker doesn't serve the calendar:** use `NewsSource = URL` and point `NewsCalendarUrl` at a CSV in the format `epoch,CURRENCY,impact`, then whitelist the URL under **Tools → Options → Expert Advisors → Allow WebRequest**.
+**If your broker doesn't serve the calendar:** the news filter cannot work on that terminal (the EA intentionally has no external-feed fallback, to stay fully offline). Options: run the EA on a terminal/broker whose build does serve the MQL5 calendar, or leave `NewsMode = OPERATE` to disable the news filter while still using the copy-trading and prop-firm features.
 
 ---
 
@@ -404,19 +390,12 @@ A `.backup` copy of each file is created before it is modified. The patcher is *
 
 ### 🪟 Windows (PowerShell)
 
-![Patcher interface — step 1](images/patch-1.png)
-
 1. Keep `Run-Patcher.bat` and `Patch-SQX-GV-Disable.ps1` **in the same folder**.
 2. Double-click **`Run-Patcher.bat`**.
-
-![Patcher options](images/patch-2.png)
-
 3. Choose an option:
    - **Option 1** — process all `.mq5` files in a folder (recursive).
    - **Option 2** — process a single file.
 4. Follow the on-screen instructions.
-
-![Patcher result](images/patch-3.png)
 
 **Other ways to run it (Windows):**
 
@@ -488,7 +467,7 @@ A: Yes — as many Slaves as you want, all reading the same Master file. Give ea
 A: It copies the Master lot × `RiskMultiplier` (1.0 = same), normalized to the Slave symbol's lot step. Adjust the multiplier for accounts of different sizes.
 
 **Q: Does the news filter work without internet / a server?**
-A: It uses MT5's native calendar (no backend or login). Confirm your broker serves it with `CheckCalendar.mq5`. If not, fall back to `NewsSource = URL`.
+A: It uses MT5's native calendar (no backend, login, or network requests). Confirm your broker serves it with `CheckCalendar.mq5`. If it doesn't, the news filter won't work on that terminal — leave `NewsMode = OPERATE` and the rest of the EA still works.
 
 **Q: What does "0 = no limit" mean?**
 A: Setting `0` on any limit disables that limit entirely.

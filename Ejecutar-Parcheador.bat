@@ -1,9 +1,9 @@
 @echo off
-title Parcheador de Archivos SQX MQL5
+title SQX MQL5 File Patcher
 cd /d "%~dp0"
 if not exist "Patch-SQX-GV-Disable.ps1" goto error_file
 
-REM Si se arrastro un archivo/carpeta, pasarlo como parametro
+REM If a file/folder was dragged, pass it as a parameter
 if not "%~1"=="" (
     powershell -ExecutionPolicy Bypass -NoProfile -File "Patch-SQX-GV-Disable.ps1" -Path "%~1"
 ) else (
@@ -15,14 +15,14 @@ goto end
 
 :error_file
 echo.
-echo [ERROR] No se encontro el archivo Patch-SQX-GV-Disable.ps1
+echo [ERROR] Could not find the file Patch-SQX-GV-Disable.ps1
 echo.
 pause
 exit /b 1
 
 :error_exec
 echo.
-echo [ERROR] Ocurrio un error al ejecutar el script.
+echo [ERROR] An error occurred while running the script.
 echo.
 pause
 exit /b 1

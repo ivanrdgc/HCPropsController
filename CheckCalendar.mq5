@@ -1,17 +1,17 @@
 //+------------------------------------------------------------------+
 //|                                                CheckCalendar.mq5  |
-//|  Verifica que el calendario económico nativo de MT5 está         |
-//|  disponible en tu broker y que HCPropsController podrá leerlo.   |
+//|  Verifies that the native MT5 economic calendar is              |
+//|  available on your broker and that HCPropsController can read it.|
 //|                                                                  |
-//|  Uso: compílalo (F7), arrástralo a un gráfico (es un Script).   |
-//|  Mira la pestaña "Expertos"/"Journal" para el resultado.        |
+//|  Usage: compile it (F7), drag it onto a chart (it is a Script).  |
+//|  Look at the "Experts"/"Journal" tab for the result.            |
 //+------------------------------------------------------------------+
 #property strict
 #property script_show_inputs
 
-input string InpCurrencies = "USD,EUR,GBP"; // Currencies a comprobar (vacío = todas)
-input int    InpDaysAhead  = 7;             // Días hacia adelante a listar
-input int    InpMinImpact  = 3;             // Impacto mínimo (1=Low,2=Moderate,3=High)
+input string InpCurrencies = "USD,EUR,GBP"; // Currencies to check (empty = all)
+input int    InpDaysAhead  = 7;             // Days ahead to list
+input int    InpMinImpact  = 3;             // Minimum impact (1=Low,2=Moderate,3=High)
 
 void OnStart()
   {
@@ -37,7 +37,7 @@ void OnStart()
       ResetLastError();
       int cnt = CalendarValueHistory(values, from, to);
       grandTotal = cnt;
-      PrintFormat("Total de eventos (todas las currencies): %d  (err=%d)", cnt, GetLastError());
+      PrintFormat("Total events (all currencies): %d  (err=%d)", cnt, GetLastError());
       for(int i = 0; i < cnt && shown < 40; i++)
         {
          MqlCalendarEvent ev;
@@ -69,13 +69,13 @@ void OnStart()
                shown++;
               }
            }
-         PrintFormat("  %s: %d eventos totales, %d con impacto>=%d  (err=%d)", curr[k], cnt, kept, InpMinImpact, GetLastError());
+         PrintFormat("  %s: %d total events, %d with impact>=%d  (err=%d)", curr[k], cnt, kept, InpMinImpact, GetLastError());
         }
      }
 
    if(grandTotal > 0)
-      PrintFormat(">>> OK: el calendario funciona en este broker (%d eventos relevantes). HCPropsController podrá leer las noticias.", grandTotal);
+      PrintFormat(">>> OK: the calendar works on this broker (%d relevant events). HCPropsController will be able to read the news.", grandTotal);
    else
-      Print(">>> ATENCIÓN: 0 eventos. Verifica: (1) terminal conectado, (2) View->Toolbox->Calendar muestra eventos, (3) el broker sirve el calendario de MetaQuotes. Si está vacío de forma persistente, usa NewsSource=URL en el EA.");
+      Print(">>> WARNING: 0 events. Check: (1) terminal connected, (2) View->Toolbox->Calendar shows events, (3) the broker serves the MetaQuotes calendar. If it is persistently empty, use NewsSource=URL in the EA.");
   }
 //+------------------------------------------------------------------+

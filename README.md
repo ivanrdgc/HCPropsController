@@ -47,7 +47,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 ## Features at a Glance
 
 - **Prop-firm risk guardian** — daily and total profit/loss limits, max parallel trades, max trades per day, consecutive win/loss streak limits, trading-hours window, and a forced close time. When a limit is hit it closes positions, deletes pending orders, and disables trading.
-- **Copy trading** — replicate one MASTER account onto any number of SLAVE accounts on the same machine, with lot multiplier, symbol mapping, inverse mode, and distance-based SL/TP (measured from each account's own fill price).
+- **Copy trading** — replicate one MASTER account onto any number of SLAVE accounts on the same machine, with auto lot scaling by point value, lot multiplier, symbol mapping, inverse mode, distance-based SL/TP (measured from each account's own fill price), and Slave→Master close propagation (a Slave-side SL/TP/manual close flattens the Master and every other Slave within ~half a second).
 - **News filter** — pause or close trading around economic news using MT5's native economic calendar (fully offline).
 - **Live information panel** — an on-chart dashboard showing status, limits, counters, schedules, and connection state.
 - **Crash-safe** — risk state is persisted in MT5 Global Variables and survives EA restarts and VPS reboots.
@@ -206,10 +206,12 @@ A Slave links to its Master purely through the **`FileName`** in the `=== SYNC F
 | Symbol mapping | `SymbolMapping` | `""` | Format `MASTER:SLAVE;MASTER2:SLAVE2`. E.g. `EURUSD:EURUSD.pro;US30:US30Cash`. Empty = same names. |
 | Copy mode | `CopyMode` | `NORMAL` | `NORMAL` also replicates SL/TP modifications; `INCOGNITO` sets SL/TP only at open and ignores later changes. |
 | Invert Master trades (and SL/TP) | `InverseMode` | `true` | `true` = trade the opposite direction (BUY→SELL) and mirror SL/TP around the entry. `false` = copy in the same direction. |
-| Lot multiplier | `RiskMultiplier` | `1.0` | Slave lot = Master lot × multiplier. `1.0` = same, `0.5` = half, `2.0` = double. |
+| Lot multiplier | `RiskMultiplier` | `1.0` | Slave lot = Master lot × multiplier, applied **after** auto lot scaling. Keep `1.0` unless you deliberately want a smaller/larger hedge. |
+| Auto lot scaling | `AutoLotScaling` | `true` | Equalizes **money per point** when contract sizes differ between brokers (e.g. an index worth $20/pt on the Slave vs $10/pt on the Master copies at half the lots automatically). Uses the point value the Master writes into the sync file. |
 | Allowed slippage (points) | `Slippage` | `10` | Permitted deviation in points. |
 | Magic Number | `MagicNumber` | `987654` | Magic of the Slave's orders. Must be unique per Slave within the **same** terminal. The EA only manages positions carrying this magic. |
-| Slave total profit limit (%) | `SlaveTotalProfitLimitPercent` | `0.0` | `0` = no limit. When reached, the Slave closes everything and stops replicating. |
+| Slave total profit limit (%) | `SlaveTotalProfitLimitPercent` | `0.0` | `0` = no limit. When reached, the Slave closes everything and stops replicating (and, with `PropagateSlaveClose`, asks the Master to close the mirrored positions too). |
+| Slave close closes Master | `PropagateSlaveClose` | `true` | If a mirrored position closes on the Slave by its own SL/TP, a manual close, a stop out, or the profit lock, the Slave asks the Master to close the original position immediately — which in turn flattens every other Slave. Set the same value on the Master and all Slaves. |
 
 #### Example SLAVE configuration
 
@@ -220,8 +222,10 @@ Symbol mapping        = "EURUSD:EURUSD.pro;US30:US30Cash"
 Copy mode             = NORMAL
 Invert Master trades  = true
 Lot multiplier        = 1.0
+Auto lot scaling      = true
 Allowed slippage      = 10
 Magic Number          = 987654
+Slave close closes Master = true
 ```
 
 > **Linking Master ↔ Slave:** they are paired solely by `FileName`. Leave the default (`master_00001.csv`) on one Master and its Slave(s) and they connect with no further setup. For a second, independent Master/Slave group on the same machine, set both of its EAs to `master_00002.csv`, and so on.
@@ -274,7 +278,8 @@ Using the smaller basis prevents the daily allowance from drifting larger than y
 One MASTER account broadcasts its open positions to any number of SLAVE accounts running on the **same machine/VPS** (communication is via a shared file — see [How Synchronization Works](#how-synchronization-works-technical)).
 
 - **Per-ticket mapping.** Each Master position is mapped to a Slave position via the order comment `HC<masterTicket>` plus the Slave's `MagicNumber`. The Slave only ever manages positions carrying its own magic.
-- **Lot sizing.** `SlaveLot = NormalizeVolume(MasterLot × RiskMultiplier)`, clamped to the symbol's min/max/step. It is **not** proportional to balance — use `RiskMultiplier` to scale between accounts of different sizes.
+- **Lot sizing.** `SlaveLot = NormalizeVolume(MasterLot × pointValueRatio × RiskMultiplier)`, clamped to the symbol's min/max/step. With `AutoLotScaling = true` the point-value ratio (Master $/point ÷ Slave $/point, from the value the Master writes per line) equalizes money-per-point across brokers with different contract sizes; `RiskMultiplier` is a pure preference on top. If the broker's min/max lots clamp the result, the Slave logs a **hedge coverage reduced** warning. It is **not** proportional to balance.
+- **Slave-close propagation.** With `PropagateSlaveClose = true` (default), a mirrored position that closes on the Slave by its own SL/TP, a manual close, a stop out, or the Slave profit lock is propagated back: the Slave writes a close request file, the Master closes the original ticket (checked every 200 ms), the sync file updates, and every other Slave flattens. Sync-driven closes (the Master closed first) are never propagated back, so there are no loops. While a request is pending the Slave will not reopen that ticket; if the Master doesn't process it within 120 s (offline, or propagation disabled there) the Slave resumes plain mirroring.
 - **Distance-based SL/TP.** The Slave doesn't copy the Master's absolute SL/TP prices — it copies the **distance** from the Master's entry and applies it to its **own actual fill price**. So if the Master enters at 1.04500 with a stop 0.01000 away (1.05500) and the Slave fills at 1.04700 (slippage / different quotes), the Slave's stop is set at 1.05700 — the same distance, preserving the intended risk. `CopyMode = NORMAL` keeps re-applying this when the Master moves its SL/TP; `INCOGNITO` sets it only at open.
 - **Inverse trading.** `InverseMode = true` (the default) flips BUY↔SELL and **mirrors** SL/TP around the entry — the Master's TP distance becomes the Slave's SL, and vice versa.
 - **Symbol mapping.** Use `SymbolMapping` (`MAST:SLAV;MAST2:SLAV2`) when broker symbol names differ.
@@ -433,19 +438,24 @@ The exit code is `1` if any file errored, `0` otherwise.
 ## How Synchronization Works (Technical)
 
 - **Transport:** a CSV file in `Common\Files\HCPropsController\` on the same machine, named by `FileName` (or a full path via `CustomFilePath`). The Master writes it and its Slave(s) read it — they're linked by using the same `FileName`. Run multiple independent groups on one machine by giving each its own file name (`master_00001.csv`, `master_00002.csv`, …).
-- **CSV format** — one line per Master ticket, 8 comma-separated fields:
+- **CSV format v2** — a `SEQ` header, one line per Master ticket (9 comma-separated fields), and an `END` footer:
   ```
-  ticket,symbol,type,volume,openPrice,sl,tp,openTime
+  SEQ,<n>
+  ticket,symbol,type,volume,openPrice,sl,tp,openTime,pointValuePerLot
+  END,<n>
   ```
-  where `type`: `0` = BUY, `1` = SELL; `volume` = the Master's real lots; `openPrice`/`sl`/`tp` = prices. The `openPrice` is what lets the Slave compute SL/TP as a distance from the Master's entry.
+  where `type`: `0` = BUY, `1` = SELL; `volume` = the Master's real lots; `openPrice`/`sl`/`tp` = prices; `pointValuePerLot` = account-currency value of a 1.0 price move per lot (used by `AutoLotScaling`). The `openPrice` is what lets the Slave compute SL/TP as a distance from the Master's entry. The `SEQ`/`END` pair (a write counter, monotonic across restarts) lets the Slave skip unchanged files and **discard torn reads** — a file caught mid-write has no matching `END` and is simply re-read 200 ms later. The old 1-second modification-time check (which could miss two writes within the same second) is gone.
 - **Master writes** only when something changes (a content hash covering ticket, symbol, type, volume, SL, TP is compared each tick, and on every trade transaction). It also force-syncs immediately when a position opens or changes.
-- **Slave reads** only when the file's modification time changed since its last read, then reconciles its positions against the file:
+- **Slave reads** the header every 200 ms (full re-parse only when `SEQ` changed) and reconciles its positions against the cached targets **every tick**, so failed opens and failed SL/TP modifications are retried automatically:
   - closes Slave positions the Master no longer has,
   - reopens a position whose direction changed,
   - reduces volume to match a Master partial close,
-  - sets/updates SL/TP as a distance from the Master's entry applied to the Slave's own fill price (re-applied each tick in `NORMAL` mode; set once at open in `INCOGNITO`),
-  - opens any Master position it does not have yet (tagged with `HC<masterTicket>`).
-- **Disconnect detection:** the Master deletes its sync file on shutdown; the Slave then shows `WAITING FOR MASTER`.
+  - sets/updates SL/TP as a distance from the Master's entry applied to the Slave's own fill price (re-applied each tick in `NORMAL` mode; in `INCOGNITO` set at open and re-tried only while the position has no levels at all),
+  - opens any Master position it does not have yet (tagged with `HC<masterTicket>`; failed opens retry every ~1.5 s).
+- **Close requests (Slave → Master):** with `PropagateSlaveClose = true`, Slave-initiated closes are written to `<syncfile>.close.<slaveLogin>` as `masterTicket,reason` lines. The Master polls `<syncfile>.close.*` every 200 ms, closes the requested tickets, deletes the request files, and rewrites the sync file so the remaining Slaves follow.
+- **Disconnect detection:** the Master deletes its sync file on shutdown; the Slave then shows `WAITING FOR MASTER`. Close requests queued while the Master is offline stay on disk and are processed when it returns.
+
+> **Upgrading from v2.00:** the file format changed — update the EA on the **Master and every Slave at the same time** (an old Slave cannot parse a v2 file and vice versa). If you had set `RiskMultiplier` to compensate for a contract-size difference (e.g. `0.5` because the Slave's index contract is worth twice as much per point), set it **back to `1.0`**: `AutoLotScaling` now handles that per symbol, and a leftover manual multiplier would halve every other symbol's hedge.
 
 ---
 
@@ -461,7 +471,10 @@ A: For equity limits and forced close, the EA closes all positions, deletes pend
 A: Yes — as many Slaves as you want, all reading the same Master file. Give each Slave a unique `MagicNumber` within the same terminal.
 
 **Q: Does the Slave copy the exact same volume?**
-A: It copies the Master lot × `RiskMultiplier` (1.0 = same), normalized to the Slave symbol's lot step. Adjust the multiplier for accounts of different sizes.
+A: With `AutoLotScaling = true` it copies the volume that gives the **same money-per-point** as the Master (so a Slave broker whose contract is worth 2× per point trades half the lots), times `RiskMultiplier` (1.0 = same), normalized to the Slave symbol's lot step. If the broker's lot limits clamp the result, a "hedge coverage reduced" warning is logged.
+
+**Q: What happens when the Slave's own SL/TP is hit before the Master's?**
+A: With `PropagateSlaveClose = true` (default), the Slave asks the Master to close the original position immediately (the Master polls every 200 ms), and every other Slave flattens as soon as the sync file updates. With `false`, the Slave keeps mirroring the file and would reopen the position on the next change.
 
 **Q: Does the news filter work without internet / a server?**
 A: It uses MT5's native calendar (no backend, login, or network requests). Confirm your broker serves it with `CheckCalendar.mq5`. If it doesn't, the news filter won't work on that terminal — leave `NewsMode = OPERATE` and the rest of the EA still works.
@@ -479,7 +492,7 @@ A: Purely by `FileName` — set the Slave's `FileName` to the same value as its 
 - Works with **MetaTrader 5** only.
 - The Windows patcher requires PowerShell; on Linux/macOS use the Python patcher.
 - Risk limits are computed from the account's detected initial balance (or `ForceInitialBalance`).
-- The panel updates every second with the latest information.
+- The EA's internal timer runs every 200 ms (sync, close requests); guardian checks and the panel update every second.
 - Copy trading requires the Master and Slave terminals to share the same `Common\Files` (i.e. run on the same machine/VPS).
 - After editing any `.mq5`, recompile it in MetaEditor (F7).
 

@@ -4,8 +4,10 @@
 //|  Single EA, file-based sync on the same VPS. No backend/license. |
 //+------------------------------------------------------------------+
 #property strict
-#property version "2.00"
+#property version "2.10"
 #property description "HCPropsController: Master/Slave copy trading, prop-firm limits and news filter in a single EA."
+#property description "v2.10: sequence-stamped sync file v2 (point value, torn-read safe), auto lot scaling,"
+#property description "200 ms reaction, and Slave->Master close propagation."
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -63,9 +65,13 @@ input string     SymbolMapping       = "";        // Mapping MAST:SLAV;MAST2:SLA
 input HCCopyMode CopyMode            = COPY_NORMAL;// Copy mode
 input bool       InverseMode         = true;      // Invert Master trades (reverse direction; mirror SL/TP)
 input double     RiskMultiplier      = 1.0;       // Lot multiplier (Slave lot = Master lot x mult)
+input bool       AutoLotScaling      = true;      // Auto-scale lots by point value (contract size differences)
 input int        Slippage            = 10;        // Allowed slippage (points)
 input long       MagicNumber         = 987654;    // Magic Number of the Slave orders
 input double     SlaveTotalProfitLimitPercent = 0.0; // Slave total profit limit (%); 0 = none
+
+input group "=== CLOSE PROPAGATION (Master and Slave) ==="
+input bool PropagateSlaveClose = true; // Slave close (SL/TP/manual/lock) also closes the Master position
 
 input group "=== EQUITY LIMITS (MASTER mode only) ==="
 input double DailyProfitLimitPercent = 4.6; // Daily profit limit (%); 0 = no limit
@@ -160,10 +166,11 @@ bool   DashboardNeedsUpdate = true;
 // Synchronization
 string   LastPositionsHash   = "";
 bool     SyncFileInitialized = false;
-datetime LastSlaveFileTime   = 0;
 bool     MasterFileExists    = false;
 int      LastSlaveDay        = -1;
 bool     SlaveWarningShown   = false;
+ulong    g_syncSeq           = 0;  // Master: write sequence (monotonic across EA restarts)
+int      g_timerTick         = 0;  // 200 ms timer tick counter (every 5th = ~1 s work)
 
 // News (cache)
 datetime g_newsTimes[];
@@ -326,7 +333,9 @@ int OnInit()
       CalculateDailyLimits();
      }
 
-   EventSetTimer(1);
+   // 200 ms timer: fast Slave reaction / close-request processing.
+   // Heavy 1-second work runs on every 5th tick (see OnTimer).
+   EventSetMillisecondTimer(200);
 
    ArrayResize(LastDashboardValues, 64);
    for(int i = 0; i < 64; i++)
@@ -806,8 +815,16 @@ void CheckNews()
 //===================================================================
 void OnTimer()
   {
+   g_timerTick++;
+   bool fullTick = (g_timerTick % 5 == 0); // timer runs at 200 ms; ~1 s cadence for heavy work
+
    if(Mode == MODE_MASTER)
      {
+      ProcessCloseRequests(); // every tick: honor Slave close requests fast
+
+      if(!fullTick)
+         return;
+
       if(PropFirmMode)
         {
          if(TimeCurrent() >= NextDailyResetTime)
@@ -829,30 +846,37 @@ void OnTimer()
      }
    else // SLAVE
      {
-      MqlDateTime ct; TimeToStruct(TimeCurrent(), ct);
-      if(LastSlaveDay != ct.day)
+      if(fullTick)
         {
-         CalculateInitialEquityDailySlave();
-         LastSlaveDay = ct.day;
-         DashboardNeedsUpdate = true;
-        }
-
-      // Slave profit limit
-      if(SlaveTotalProfitLimitPercent > 0 && !SlaveProfitLocked)
-        {
-         CAccountInfo acc;
-         double cap = AccountDepositsAndWithdrawals * (1.0 + SlaveTotalProfitLimitPercent / 100.0);
-         if(AccountDepositsAndWithdrawals > 0 && acc.Equity() >= cap)
+         MqlDateTime ct; TimeToStruct(TimeCurrent(), ct);
+         if(LastSlaveDay != ct.day)
            {
-            SlaveProfitLocked = true;
-            CloseAllPositions(true);
-            Print("SLAVE: profit limit reached (", SlaveTotalProfitLimitPercent, "%). Replication stopped.");
+            CalculateInitialEquityDailySlave();
+            LastSlaveDay = ct.day;
+            DashboardNeedsUpdate = true;
+           }
+
+         // Slave profit limit
+         if(SlaveTotalProfitLimitPercent > 0 && !SlaveProfitLocked)
+           {
+            CAccountInfo acc;
+            double cap = AccountDepositsAndWithdrawals * (1.0 + SlaveTotalProfitLimitPercent / 100.0);
+            if(AccountDepositsAndWithdrawals > 0 && acc.Equity() >= cap)
+              {
+               SlaveProfitLocked = true;
+               if(PropagateSlaveClose)
+                  EnqueueAllReplicatedCloses("PROFIT_LOCK"); // Master (and the other Slaves) follow
+               CloseAllPositions(true);
+               Print("SLAVE: profit limit reached (", SlaveTotalProfitLimitPercent, "%). Replication stopped.");
+              }
            }
         }
 
       if(!SlaveProfitLocked)
          SlaveSync();
-      UpdateDashboard();
+      FlushCloseRequests(); // retried every tick until the request file is written
+      if(fullTick)
+         UpdateDashboard();
      }
   }
 
@@ -863,39 +887,85 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
   {
-   if(Mode != MODE_MASTER)
-      return;
-
-   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   if(Mode == MODE_MASTER)
      {
-      HistorySelect(0, TimeCurrent());
-      bool ok = HistoryDealSelect(trans.deal);
-      int retry = 0;
-      while(!ok && retry < 3) { Sleep(10); HistorySelect(0, TimeCurrent()); ok = HistoryDealSelect(trans.deal); retry++; }
-
-      if(ok)
+      if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
         {
-         CDealInfo deal; deal.Ticket(trans.deal);
-         if(deal.Entry() == DEAL_ENTRY_IN)
-            CountTradesOpenedToday();
-         else if(deal.Entry() == DEAL_ENTRY_OUT)
-           {
-            Sleep(10);
-            CountConsecutiveWinsLosses();
-            DashboardNeedsUpdate = true;
-           }
-        }
-      else
-         CountTradesOpenedToday();
+         HistorySelect(0, TimeCurrent());
+         bool ok = HistoryDealSelect(trans.deal);
+         int retry = 0;
+         while(!ok && retry < 3) { Sleep(10); HistorySelect(0, TimeCurrent()); ok = HistoryDealSelect(trans.deal); retry++; }
 
-      CountCurrentTrades();
-      if(PropFirmMode)
-         CheckGuardRules();
-      SyncPositionsToFile();
+         if(ok)
+           {
+            CDealInfo deal; deal.Ticket(trans.deal);
+            if(deal.Entry() == DEAL_ENTRY_IN)
+               CountTradesOpenedToday();
+            else if(deal.Entry() == DEAL_ENTRY_OUT)
+              {
+               Sleep(10);
+               CountConsecutiveWinsLosses();
+               DashboardNeedsUpdate = true;
+              }
+           }
+         else
+            CountTradesOpenedToday();
+
+         CountCurrentTrades();
+         if(PropFirmMode)
+            CheckGuardRules();
+         SyncPositionsToFile();
+        }
+
+      if(trans.type == TRADE_TRANSACTION_POSITION)
+         SyncPositionsToFile();
+      return;
      }
 
-   if(trans.type == TRADE_TRANSACTION_POSITION)
-      SyncPositionsToFile();
+   // ---- SLAVE: detect broker/user-initiated closes of mirrored positions ----
+   // When the Slave's own SL/TP (or a manual close / stop out) closes a mirrored
+   // position while the Master still holds it, ask the Master to close it too,
+   // so the Master and every other Slave flatten immediately.
+   if(!PropagateSlaveClose)
+      return;
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+
+   HistorySelect(0, TimeCurrent());
+   bool ok = HistoryDealSelect(trans.deal);
+   int retry = 0;
+   while(!ok && retry < 3) { Sleep(10); HistorySelect(0, TimeCurrent()); ok = HistoryDealSelect(trans.deal); retry++; }
+   if(!ok)
+      return;
+
+   if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != MagicNumber)
+      return;
+   ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
+      return;
+   ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(trans.deal, DEAL_REASON);
+   // DEAL_REASON_EXPERT = our own sync close (Master already flat) -> never propagate.
+   bool propagate = (reason == DEAL_REASON_SL || reason == DEAL_REASON_TP || reason == DEAL_REASON_SO ||
+                     reason == DEAL_REASON_CLIENT || reason == DEAL_REASON_MOBILE || reason == DEAL_REASON_WEB);
+   if(!propagate)
+      return;
+
+   ulong posId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+   if(posId == 0)
+      return;
+   if(PositionSelectByTicket(posId))
+      return; // partial close: the position is still open, keep mirroring
+
+   ulong mTicket = MasterTicketForSlavePosition(posId);
+   if(mTicket == 0)
+      return;
+
+   string rs = (reason == DEAL_REASON_SL ? "SL" :
+                reason == DEAL_REASON_TP ? "TP" :
+                reason == DEAL_REASON_SO ? "STOPOUT" : "MANUAL");
+   Print("SLAVE: mirrored position closed by ", rs, " -> requesting Master close of #", mTicket);
+   EnqueueMasterClose(mTicket, rs);
+   FlushCloseRequests();
   }
 
 //===================================================================
@@ -1051,6 +1121,23 @@ string PositionsHash()
    return s;
   }
 
+// Value (account currency) of a 1.0 price move per 1 lot. Lets the Slave
+// equalize money-per-point when contract sizes differ between brokers.
+double PointValuePerLot(string symbol)
+  {
+   double tv = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   double ts = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   return (tv > 0 && ts > 0) ? tv / ts : 0.0;
+  }
+
+// File format v2:
+//   SEQ,<n>
+//   ticket,symbol,type,volume,openPrice,sl,tp,openTime,pointValuePerLot
+//   ...
+//   END,<n>
+// The SEQ/END pair detects both unchanged content (same seq) and torn reads
+// (Slave reading while the Master rewrites): a file without a matching END
+// is discarded and re-read on the next 200 ms tick.
 bool WriteSyncFile()
   {
    string rel = GetSyncFilePath();
@@ -1059,12 +1146,18 @@ bool WriteSyncFile()
    ResetLastError();
    FolderCreate(HCPROPS_KEY, FILE_COMMON); // if it already exists, returns error 5019 (ignored)
 
+   if(g_syncSeq == 0)
+      g_syncSeq = (ulong)GetTickCount64(); // survives EA restarts without repeating old values
+   g_syncSeq++;
+
    ResetLastError();
-   int h = FileOpen(rel, FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_SHARE_WRITE, ',');
+   int h = FileOpen(rel, FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE, ',');
    int retry = 0;
-   while(h == INVALID_HANDLE && retry < 2) { Sleep(10); ResetLastError(); h = FileOpen(rel, FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_SHARE_WRITE, ','); retry++; }
+   while(h == INVALID_HANDLE && retry < 2) { Sleep(10); ResetLastError(); h = FileOpen(rel, FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE, ','); retry++; }
    if(h == INVALID_HANDLE)
      { Print("ERROR: could not open sync file: ", rel, " err=", GetLastError()); return false; }
+
+   FileWrite(h, "SEQ", IntegerToString((long)g_syncSeq));
 
    SyncPos arr[];
    int n = GetSyncPositions(arr);
@@ -1079,8 +1172,11 @@ bool WriteSyncFile()
                 DoubleToString(arr[i].openPrice, dg),
                 DoubleToString(arr[i].sl, dg),
                 DoubleToString(arr[i].tp, dg),
-                IntegerToString((long)arr[i].openTime));
+                IntegerToString((long)arr[i].openTime),
+                DoubleToString(PointValuePerLot(arr[i].symbol), 5));
      }
+
+   FileWrite(h, "END", IntegerToString((long)g_syncSeq));
    FileClose(h);
    return true;
   }
@@ -1106,12 +1202,39 @@ struct TargetPos
    string             symbol;     // symbol already mapped to the Slave
    ENUM_POSITION_TYPE dir;        // direction already inverted if applicable
    double             volume;     // normalized Slave lots
+   double             rawVolume;  // requested lots before min/max/step normalization (clamp warning)
    double             slDist;     // SL offset from the Master entry, applied to the Slave's own fill price
    double             tpDist;     // TP offset from the Master entry, applied to the Slave's own fill price
    bool               hasSL;
    bool               hasTP;
    bool               matched;
   };
+
+//===================================================================
+// SYNC v2 STATE (cached targets, close propagation)
+//===================================================================
+ulong     g_lastSeqSeen = 0;     // last sequence successfully parsed by the Slave
+bool      g_haveTargets = false; // at least one complete parse done (gate for reconciliation)
+TargetPos g_targets[];           // cached Master targets, reconciled every 200 ms tick
+
+// Slave position ticket -> Master ticket (rebuilt on every reconcile pass; used
+// to identify which Master position a broker-side close belonged to)
+ulong g_mapSlaveTicket[];
+ulong g_mapMasterTicket[];
+
+// Master tickets this Slave closed on its own (SL/TP/manual/lock). They are not
+// reopened while the Master processes the close request; pruned when the ticket
+// leaves the Master file, or after 120 s (Master unreachable / propagation off).
+ulong    g_closedMasterTicket[];
+datetime g_closedMasterWhen[];
+
+// Pending close requests for the Master (flushed to <syncfile>.close.<login>)
+ulong  g_closeReqTicket[];
+string g_closeReqReason[];
+
+// Per-ticket throttle: failed opens retry every ~1.5 s instead of every tick
+ulong g_openTryTicket[];
+ulong g_openTryWhenMs[];
 
 double NormalizeVolume(string symbol, double vol)
   {
@@ -1165,62 +1288,346 @@ void ApplySlaveLevels(CTrade &trade, ulong masterTicket, ENUM_POSITION_TYPE dir,
      }
   }
 
-void SlaveSync()
+//-------------------------------------------------------------------
+// Closed-ticket memory (Slave): tickets we closed on our own and asked
+// the Master to close. Prevents the open-phase from re-opening them.
+//-------------------------------------------------------------------
+bool IsClosedMasterTicket(ulong mTicket)
   {
-   if(Mode != MODE_SLAVE)
+   for(int i = 0; i < ArraySize(g_closedMasterTicket); i++)
+      if(g_closedMasterTicket[i] == mTicket)
+         return true;
+   return false;
+  }
+
+void RememberClosedMasterTicket(ulong mTicket)
+  {
+   if(IsClosedMasterTicket(mTicket))
       return;
+   int n = ArraySize(g_closedMasterTicket);
+   ArrayResize(g_closedMasterTicket, n + 1);
+   ArrayResize(g_closedMasterWhen,   n + 1);
+   g_closedMasterTicket[n] = mTicket;
+   g_closedMasterWhen[n]   = TimeLocal();
+  }
 
-   string rel = GetSyncFilePath();
-
-   if(!FileIsExist(rel, FILE_COMMON))
+void PruneClosedMasterTickets()
+  {
+   for(int i = ArraySize(g_closedMasterTicket) - 1; i >= 0; i--)
      {
-      if(MasterFileExists)
-        { MasterFileExists = false; Print("SLAVE: Master disconnected. Waiting for reconnection..."); }
-      else if(!SlaveWarningShown)
-        { Print("SLAVE: Master file not found: ", rel); SlaveWarningShown = true; }
-      return;
+      bool inTargets = false;
+      for(int t = 0; t < ArraySize(g_targets); t++)
+         if(g_targets[t].masterTicket == g_closedMasterTicket[i])
+           { inTargets = true; break; }
+      // Gone from the Master file (processed), or stale for 120 s (Master off or
+      // propagation disabled there) -> forget; mirroring resumes for that ticket.
+      if(!inTargets || (TimeLocal() - g_closedMasterWhen[i] > 120))
+        {
+         if(inTargets)
+            Print("SLAVE: Master did not process close request for #", g_closedMasterTicket[i], " in 120 s - resuming mirror");
+         ArrayRemove(g_closedMasterTicket, i, 1);
+         ArrayRemove(g_closedMasterWhen,   i, 1);
+        }
      }
-   if(!MasterFileExists)
-     { MasterFileExists = true; SlaveWarningShown = false; Print("SLAVE: Master connected. Syncing..."); }
+  }
 
-   // Optimization: only read if the modification date changed
-   datetime mtime = (datetime)FileGetInteger(rel, FILE_MODIFY_DATE, true);
-   if(mtime == 0)
-      mtime = TimeCurrent();
-   else if(mtime <= LastSlaveFileTime && LastSlaveFileTime > 0)
+//-------------------------------------------------------------------
+// Close requests: Slave -> Master  (file <syncfile>.close.<login>)
+//-------------------------------------------------------------------
+string CloseRequestPath()
+  {
+   return GetSyncFilePath() + ".close." + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+  }
+
+void EnqueueMasterClose(ulong mTicket, string reason)
+  {
+   if(mTicket == 0)
       return;
+   for(int i = 0; i < ArraySize(g_closeReqTicket); i++)
+      if(g_closeReqTicket[i] == mTicket)
+         return;
+   int n = ArraySize(g_closeReqTicket);
+   ArrayResize(g_closeReqTicket, n + 1);
+   ArrayResize(g_closeReqReason, n + 1);
+   g_closeReqTicket[n] = mTicket;
+   g_closeReqReason[n] = reason;
+   RememberClosedMasterTicket(mTicket);
+  }
+
+void EnqueueAllReplicatedCloses(string reason)
+  {
+   CPositionInfo p;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(!p.SelectByIndex(i))
+         continue;
+      if((long)p.Magic() != MagicNumber)
+         continue;
+      ulong mt = ParseMasterTicketFromComment(p.Comment());
+      if(mt > 0)
+         EnqueueMasterClose(mt, reason);
+     }
+  }
+
+// Write the queued requests, merging any tickets the Master has not consumed
+// yet. On any open failure we simply keep the queue and retry next tick.
+void FlushCloseRequests()
+  {
+   if(Mode != MODE_SLAVE || ArraySize(g_closeReqTicket) == 0)
+      return;
+
+   string rel = CloseRequestPath();
+
+   ulong  tk[]; string rs[];
+   if(FileIsExist(rel, FILE_COMMON))
+     {
+      int hr = FileOpen(rel, FILE_READ | FILE_CSV | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE, ',');
+      if(hr == INVALID_HANDLE)
+         return; // Master is reading/deleting it right now -> retry next tick
+      while(!FileIsEnding(hr))
+        {
+         string t = FileReadString(hr);
+         if(StringLen(t) == 0)
+            break;
+         string r = FileIsLineEnding(hr) ? "" : FileReadString(hr);
+         ulong v = (ulong)StringToInteger(t);
+         if(v == 0)
+            continue;
+         int n = ArraySize(tk);
+         ArrayResize(tk, n + 1); ArrayResize(rs, n + 1);
+         tk[n] = v; rs[n] = r;
+        }
+      FileClose(hr);
+     }
+
+   for(int i = 0; i < ArraySize(g_closeReqTicket); i++)
+     {
+      bool dup = false;
+      for(int j = 0; j < ArraySize(tk); j++)
+         if(tk[j] == g_closeReqTicket[i])
+           { dup = true; break; }
+      if(dup)
+         continue;
+      int n = ArraySize(tk);
+      ArrayResize(tk, n + 1); ArrayResize(rs, n + 1);
+      tk[n] = g_closeReqTicket[i]; rs[n] = g_closeReqReason[i];
+     }
 
    ResetLastError();
-   int h = FileOpen(rel, FILE_READ | FILE_CSV | FILE_COMMON | FILE_SHARE_READ, ',');
+   int h = FileOpen(rel, FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_SHARE_READ, ',');
    if(h == INVALID_HANDLE)
-     {
-      if(GetLastError() != 5002)
-         Print("SLAVE: could not open the Master file. err=", GetLastError());
+      return; // retry next tick
+   for(int i = 0; i < ArraySize(tk); i++)
+      FileWrite(h, IntegerToString((long)tk[i]), rs[i]);
+   FileClose(h);
+
+   Print("SLAVE: close request file written (", ArraySize(tk), " ticket(s))");
+   ArrayResize(g_closeReqTicket, 0);
+   ArrayResize(g_closeReqReason, 0);
+  }
+
+// MASTER: poll <syncfile>.close.* every 200 ms and close the requested tickets.
+// The resulting DEAL_ADD transactions rewrite the sync file, so every other
+// Slave flattens on its next tick.
+void ProcessCloseRequests()
+  {
+   if(Mode != MODE_MASTER || !PropagateSlaveClose)
       return;
+
+   string base = GetSyncFilePath();
+
+   // Folder part of the sync path (FileFindFirst returns bare names)
+   string folder = "";
+   string parts[];
+   int np = StringSplit(base, '\\', parts);
+   if(np > 1)
+     {
+      folder = parts[0];
+      for(int i = 1; i < np - 1; i++)
+         folder += "\\" + parts[i];
      }
 
-   // ---- Build target list from the file ----
-   TargetPos targets[];
-   ArrayResize(targets, 0);
+   string found;
+   long fh = FileFindFirst(base + ".close.*", found, FILE_COMMON);
+   if(fh == INVALID_HANDLE)
+      return;
+   string files[];
+   do
+     {
+      int n = ArraySize(files);
+      ArrayResize(files, n + 1);
+      files[n] = found;
+     }
+   while(FileFindNext(fh, found));
+   FileFindClose(fh);
+
+   CTrade trade;
+   trade.SetDeviationInPoints(Slippage);
+   bool closedAny = false;
+
+   for(int f = 0; f < ArraySize(files); f++)
+     {
+      string rel = (folder == "") ? files[f] : folder + "\\" + files[f];
+      int h = FileOpen(rel, FILE_READ | FILE_CSV | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE, ',');
+      if(h == INVALID_HANDLE)
+         continue; // a Slave is writing it right now -> retry next tick
+      while(!FileIsEnding(h))
+        {
+         string t = FileReadString(h);
+         if(StringLen(t) == 0)
+            break;
+         string r = FileIsLineEnding(h) ? "" : FileReadString(h);
+         ulong ticket = (ulong)StringToInteger(t);
+         if(ticket == 0)
+            continue;
+         if(PositionSelectByTicket(ticket))
+           {
+            trade.SetTypeFillingBySymbol(PositionGetString(POSITION_SYMBOL));
+            if(trade.PositionClose(ticket))
+              {
+               closedAny = true;
+               Print("MASTER: position #", ticket, " closed on Slave request (", r, ") [", files[f], "]");
+              }
+            else
+               Print("MASTER: FAILED to close #", ticket, " on Slave request (", r, ") ret=",
+                     trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(), ")");
+           }
+         else
+            Print("MASTER: Slave close request for #", ticket, " (", r, ") - already closed");
+        }
+      FileClose(h);
+      FileDelete(rel, FILE_COMMON);
+     }
+
+   if(closedAny)
+      SyncPositionsToFile();
+  }
+
+//-------------------------------------------------------------------
+// Slave position ticket -> Master ticket
+//-------------------------------------------------------------------
+void RebuildSlaveMasterMap()
+  {
+   ArrayResize(g_mapSlaveTicket, 0);
+   ArrayResize(g_mapMasterTicket, 0);
+   CPositionInfo p;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(!p.SelectByIndex(i))
+         continue;
+      if((long)p.Magic() != MagicNumber)
+         continue;
+      ulong mt = ParseMasterTicketFromComment(p.Comment());
+      if(mt == 0)
+         continue;
+      int n = ArraySize(g_mapSlaveTicket);
+      ArrayResize(g_mapSlaveTicket, n + 1);
+      ArrayResize(g_mapMasterTicket, n + 1);
+      g_mapSlaveTicket[n]  = p.Ticket();
+      g_mapMasterTicket[n] = mt;
+     }
+  }
+
+ulong MasterTicketForSlavePosition(ulong posId)
+  {
+   for(int i = 0; i < ArraySize(g_mapSlaveTicket); i++)
+      if(g_mapSlaveTicket[i] == posId)
+         return g_mapMasterTicket[i];
+
+   // Fallback (EA just restarted): take the comment of the position's IN deal
+   if(HistorySelectByPosition(posId))
+     {
+      int n = HistoryDealsTotal();
+      for(int i = 0; i < n; i++)
+        {
+         ulong d = HistoryDealGetTicket(i);
+         if(d == 0)
+            continue;
+         if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_IN)
+            continue;
+         ulong mt = ParseMasterTicketFromComment(HistoryDealGetString(d, DEAL_COMMENT));
+         if(mt > 0)
+            return mt;
+        }
+     }
+   return 0;
+  }
+
+//-------------------------------------------------------------------
+// Open-attempt throttle (failed opens retry every ~1.5 s, not 200 ms)
+//-------------------------------------------------------------------
+bool OpenRecentlyTried(ulong mTicket)
+  {
+   ulong now = (ulong)GetTickCount64();
+   for(int i = 0; i < ArraySize(g_openTryTicket); i++)
+      if(g_openTryTicket[i] == mTicket)
+        {
+         if(now - g_openTryWhenMs[i] < 1500)
+            return true;
+         g_openTryWhenMs[i] = now;
+         return false;
+        }
+   int n = ArraySize(g_openTryTicket);
+   ArrayResize(g_openTryTicket, n + 1);
+   ArrayResize(g_openTryWhenMs, n + 1);
+   g_openTryTicket[n] = mTicket;
+   g_openTryWhenMs[n] = now;
+   return false;
+  }
+
+//-------------------------------------------------------------------
+// Parse the Master file into 'out'.
+// Returns 0 = parsed new content, 1 = unchanged (same SEQ), 2 = torn/incomplete.
+//-------------------------------------------------------------------
+int ParseMasterFile(int h, TargetPos &out[])
+  {
+   ArrayResize(out, 0);
+   bool  isSeq = false, gotEnd = false, first = true;
+   ulong seq = 0;
+
    while(!FileIsEnding(h))
      {
-      string sTicket = FileReadString(h);
-      if(StringLen(sTicket) == 0)
+      string f1 = FileReadString(h);
+      if(StringLen(f1) == 0)
          break;
+
+      if(first && f1 == "SEQ")
+        {
+         first = false;
+         isSeq = true;
+         seq   = (ulong)StringToInteger(FileReadString(h));
+         if(g_haveTargets && seq == g_lastSeqSeen)
+            return 1; // nothing new
+         continue;
+        }
+      first = false;
+
+      if(f1 == "END")
+        {
+         string s2 = FileIsLineEnding(h) ? "" : FileReadString(h);
+         gotEnd = !isSeq || ((ulong)StringToInteger(s2) == seq);
+         break;
+        }
+
+      // ---- position record ----
       string sSymbol = FileReadString(h);
       string sType   = FileReadString(h);
       string sVol    = FileReadString(h);
-      string sOpen   = FileReadString(h);   // openPrice (not used for market orders)
+      string sOpen   = FileReadString(h);   // Master entry: SL/TP distances are measured from here
       string sSL     = FileReadString(h);
       string sTP     = FileReadString(h);
       string sTime   = FileReadString(h);   // openTime (informational)
+      string sPV     = FileIsLineEnding(h) ? "" : FileReadString(h); // v2: Master point value per lot
 
-      ulong  mTicket = (ulong)StringToInteger(sTicket);
+      ulong  mTicket = (ulong)StringToInteger(f1);
       int    mType   = (int)StringToInteger(sType);
       double mVol    = StringToDouble(sVol);
-      double mEntry  = StringToDouble(sOpen);   // Master entry: SL/TP are measured as distances from here
+      double mEntry  = StringToDouble(sOpen);
       double mSL     = StringToDouble(sSL);
       double mTP     = StringToDouble(sTP);
+      double mPV     = StringToDouble(sPV);
+      if(mTicket == 0 || StringLen(sSymbol) == 0)
+         continue;
 
       // SL/TP as signed distances from the Master's entry (broker/slippage-independent).
       bool   hSL = (mSL != 0.0);
@@ -1241,29 +1648,101 @@ void SlaveSync()
          tpDist = dSL; sHasTP = hSL;
         }
 
-      double vol = NormalizeVolume(slaveSymbol, mVol * RiskMultiplier);
+      // Equalize money-per-point across brokers (e.g. one broker's index contract
+      // is worth 2x the other's): scale by the point-value ratio, then apply
+      // RiskMultiplier as a pure user preference on top.
+      double scale = 1.0;
+      if(AutoLotScaling && mPV > 0)
+        {
+         double spv = PointValuePerLot(slaveSymbol);
+         if(spv > 0)
+            scale = mPV / spv;
+        }
+
+      double req = mVol * RiskMultiplier * scale;
+      double vol = NormalizeVolume(slaveSymbol, req);
       if(vol <= 0)
          continue;
 
-      int sz = ArraySize(targets);
-      ArrayResize(targets, sz + 1);
-      targets[sz].masterTicket = mTicket;
-      targets[sz].symbol  = slaveSymbol;
-      targets[sz].dir     = sDir;
-      targets[sz].volume  = vol;
-      targets[sz].slDist  = slDist;
-      targets[sz].tpDist  = tpDist;
-      targets[sz].hasSL   = sHasSL;
-      targets[sz].hasTP   = sHasTP;
-      targets[sz].matched = false;
+      int sz = ArraySize(out);
+      ArrayResize(out, sz + 1);
+      out[sz].masterTicket = mTicket;
+      out[sz].symbol    = slaveSymbol;
+      out[sz].dir       = sDir;
+      out[sz].volume    = vol;
+      out[sz].rawVolume = req;
+      out[sz].slDist    = slDist;
+      out[sz].tpDist    = tpDist;
+      out[sz].hasSL     = sHasSL;
+      out[sz].hasTP     = sHasTP;
+      out[sz].matched   = false;
      }
-   FileClose(h);
-   LastSlaveFileTime = mtime;
 
+   if(isSeq && !gotEnd)
+      return 2; // Master was mid-write: discard, keep the previous state, retry next tick
+   if(isSeq)
+      g_lastSeqSeen = seq;
+   return 0;
+  }
+
+void SlaveSync()
+  {
+   if(Mode != MODE_SLAVE)
+      return;
+
+   string rel = GetSyncFilePath();
+
+   if(!FileIsExist(rel, FILE_COMMON))
+     {
+      if(MasterFileExists)
+        { MasterFileExists = false; Print("SLAVE: Master disconnected. Waiting for reconnection..."); }
+      else if(!SlaveWarningShown)
+        { Print("SLAVE: Master file not found: ", rel); SlaveWarningShown = true; }
+      return; // never reconcile without a Master file (it may be restarting)
+     }
+   if(!MasterFileExists)
+     { MasterFileExists = true; SlaveWarningShown = false; g_lastSeqSeen = 0; Print("SLAVE: Master connected. Syncing..."); }
+
+   ResetLastError();
+   int h = FileOpen(rel, FILE_READ | FILE_CSV | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE, ',');
+   if(h == INVALID_HANDLE)
+      return; // collision with a Master write: retry in 200 ms
+
+   TargetPos fresh[];
+   int rc = ParseMasterFile(h, fresh);
+   FileClose(h);
+
+   if(rc == 2)
+      return; // torn read
+   if(rc == 0)
+     {
+      int n = ArraySize(fresh);
+      ArrayResize(g_targets, n);
+      for(int i = 0; i < n; i++)
+         g_targets[i] = fresh[i];
+      g_haveTargets = true;
+     }
+
+   // Reconcile on EVERY tick (not just on file changes): retries failed
+   // opens/level-applies and keeps positions aligned at a 200 ms cadence.
+   if(g_haveTargets)
+     {
+      PruneClosedMasterTickets(); // every tick, so the 120 s fallback works even if the file never changes
+      ReconcileSlavePositions();
+     }
+  }
+
+void ReconcileSlavePositions()
+  {
    CTrade trade;
    trade.SetExpertMagicNumber((ulong)MagicNumber);
    trade.SetDeviationInPoints(Slippage);
    CPositionInfo pos;
+
+   RebuildSlaveMasterMap();
+
+   for(int t = 0; t < ArraySize(g_targets); t++)
+      g_targets[t].matched = false;
 
    // ---- Iterate Slave positions (filtered by magic) ----
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -1277,13 +1756,13 @@ void SlaveSync()
       int   idx = -1;
       // 1) match by Master ticket
       if(mt != 0)
-         for(int t = 0; t < ArraySize(targets); t++)
-            if(!targets[t].matched && targets[t].masterTicket == mt)
+         for(int t = 0; t < ArraySize(g_targets); t++)
+            if(!g_targets[t].matched && g_targets[t].masterTicket == mt)
               { idx = t; break; }
       // 2) fallback: by symbol + direction if the comment was lost
       if(idx < 0)
-         for(int t = 0; t < ArraySize(targets); t++)
-            if(!targets[t].matched && targets[t].symbol == pos.Symbol() && targets[t].dir == pos.PositionType())
+         for(int t = 0; t < ArraySize(g_targets); t++)
+            if(!g_targets[t].matched && g_targets[t].symbol == pos.Symbol() && g_targets[t].dir == pos.PositionType())
               { idx = t; break; }
 
       if(idx < 0)
@@ -1294,25 +1773,25 @@ void SlaveSync()
          continue;
         }
 
-      targets[idx].matched = true;
+      g_targets[idx].matched = true;
 
       // Different direction -> close and reopen
-      if(pos.PositionType() != targets[idx].dir)
+      if(pos.PositionType() != g_targets[idx].dir)
         {
          trade.SetTypeFillingBySymbol(pos.Symbol());
          trade.PositionClose(pos.Ticket());
-         continue; // will be reopened below (stays matched=true but with no position; opened in the open phase)
+         continue; // reopened below in the open phase
         }
 
       // Volume adjustment (reduction only; respects Master partial close)
       double cur = pos.Volume();
-      double diff = targets[idx].volume - cur;
+      double diff = g_targets[idx].volume - cur;
       CSymbolInfo si; si.Name(pos.Symbol());
       double step = si.LotsStep();
       double tol  = (step > 0) ? step : 0.0001;
       if(diff < -tol)
         {
-         double closeVol = cur - targets[idx].volume;
+         double closeVol = cur - g_targets[idx].volume;
          if(step > 0) closeVol = MathFloor(closeVol / step + 0.5) * step;
          if(closeVol >= si.LotsMin() && closeVol < cur)
            {
@@ -1321,22 +1800,32 @@ void SlaveSync()
            }
         }
 
-      // Replicate SL/TP in NORMAL mode, measured from THIS position's own entry price.
       if(CopyMode == COPY_NORMAL)
         {
+         // Replicate SL/TP, measured from THIS position's own entry price.
          int    dg = (int)si.Digits();
          double entry  = pos.PriceOpen();
-         double wantSL = targets[idx].hasSL ? NormalizeDouble(entry + targets[idx].slDist, dg) : 0.0;
-         double wantTP = targets[idx].hasTP ? NormalizeDouble(entry + targets[idx].tpDist, dg) : 0.0;
+         double wantSL = g_targets[idx].hasSL ? NormalizeDouble(entry + g_targets[idx].slDist, dg) : 0.0;
+         double wantTP = g_targets[idx].hasTP ? NormalizeDouble(entry + g_targets[idx].tpDist, dg) : 0.0;
          if(MathAbs(pos.StopLoss() - wantSL) > si.Point() || MathAbs(pos.TakeProfit() - wantTP) > si.Point())
             trade.PositionModify(pos.Ticket(), wantSL, wantTP);
+        }
+      else if(pos.StopLoss() == 0.0 && pos.TakeProfit() == 0.0 &&
+              (g_targets[idx].hasSL || g_targets[idx].hasTP))
+        {
+         // INCOGNITO: levels are only set on open, but if that initial modify
+         // failed the position would stay unprotected - retry until it sticks.
+         int    dg = (int)si.Digits();
+         double entry = pos.PriceOpen();
+         double sl = g_targets[idx].hasSL ? NormalizeDouble(entry + g_targets[idx].slDist, dg) : 0.0;
+         double tp = g_targets[idx].hasTP ? NormalizeDouble(entry + g_targets[idx].tpDist, dg) : 0.0;
+         trade.SetTypeFillingBySymbol(pos.Symbol());
+         trade.PositionModify(pos.Ticket(), sl, tp);
         }
      }
 
    // ---- Open the Master positions the Slave does not have yet ----
-   // (recount matched: a position whose direction changed was closed above and must be reopened)
-   // Recompute which tickets are still present in the Slave
-   for(int t = 0; t < ArraySize(targets); t++)
+   for(int t = 0; t < ArraySize(g_targets); t++)
      {
       bool present = false;
       for(int i = 0; i < PositionsTotal(); i++)
@@ -1345,29 +1834,42 @@ void SlaveSync()
             continue;
          if((long)pos.Magic() != MagicNumber)
             continue;
-         if(ParseMasterTicketFromComment(pos.Comment()) == targets[t].masterTicket && pos.PositionType() == targets[t].dir)
+         if(ParseMasterTicketFromComment(pos.Comment()) == g_targets[t].masterTicket && pos.PositionType() == g_targets[t].dir)
            { present = true; break; }
         }
       if(present)
          continue;
 
-      string sym = targets[t].symbol;
+      // Closed here on purpose (own SL/TP/manual/lock): the Master is being asked
+      // to close it; do NOT reopen.
+      if(PropagateSlaveClose && IsClosedMasterTicket(g_targets[t].masterTicket))
+         continue;
+
+      if(OpenRecentlyTried(g_targets[t].masterTicket))
+         continue;
+
+      string sym = g_targets[t].symbol;
       if(!SymbolSelect(sym, true))
         { Print("SLAVE: symbol not available at the broker: ", sym); continue; }
 
+      if(g_targets[t].volume < g_targets[t].rawVolume - 1e-8)
+         Print("SLAVE: WARNING volume clamped by broker limits: requested ",
+               DoubleToString(g_targets[t].rawVolume, 2), " -> trading ",
+               DoubleToString(g_targets[t].volume, 2), " (hedge coverage reduced!)");
+
       trade.SetTypeFillingBySymbol(sym);
-      string comment = "HC" + IntegerToString((long)targets[t].masterTicket);
+      string comment = "HC" + IntegerToString((long)g_targets[t].masterTicket);
       bool ok;
       // Open at market WITHOUT SL/TP first; they are set right after, measured from the real fill price.
-      if(targets[t].dir == POSITION_TYPE_BUY)
-         ok = trade.Buy(targets[t].volume, sym, 0.0, 0.0, 0.0, comment);
+      if(g_targets[t].dir == POSITION_TYPE_BUY)
+         ok = trade.Buy(g_targets[t].volume, sym, 0.0, 0.0, 0.0, comment);
       else
-         ok = trade.Sell(targets[t].volume, sym, 0.0, 0.0, 0.0, comment);
+         ok = trade.Sell(g_targets[t].volume, sym, 0.0, 0.0, 0.0, comment);
       if(!ok)
-        { Print("SLAVE: error opening ", sym, " vol=", targets[t].volume, " ret=", trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(), ")"); continue; }
+        { Print("SLAVE: error opening ", sym, " vol=", g_targets[t].volume, " ret=", trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(), ")"); continue; }
 
-      ApplySlaveLevels(trade, targets[t].masterTicket, targets[t].dir,
-                       targets[t].slDist, targets[t].tpDist, targets[t].hasSL, targets[t].hasTP);
+      ApplySlaveLevels(trade, g_targets[t].masterTicket, g_targets[t].dir,
+                       g_targets[t].slDist, g_targets[t].tpDist, g_targets[t].hasSL, g_targets[t].hasTP);
      }
   }
 

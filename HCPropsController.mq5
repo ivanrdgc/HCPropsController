@@ -4,10 +4,11 @@
 //|  Single EA, file-based sync on the same VPS. No backend/license. |
 //+------------------------------------------------------------------+
 #property strict
-#property version "2.10"
+#property version "2.20"
 #property description "HCPropsController: Master/Slave copy trading, prop-firm limits and news filter in a single EA."
-#property description "v2.10: sequence-stamped sync file v2 (point value, torn-read safe), auto lot scaling,"
-#property description "200 ms reaction, and Slave->Master close propagation."
+#property description "v2.20: full guardian (equity/count/streak/hours/forced-close/news) on Master AND Slave,"
+#property description "unified dashboard, and Slave->Master lock propagation: new orders are only accepted"
+#property description "while every account has trading enabled (PropagateSlaveClose)."
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -51,9 +52,9 @@ enum HCNewsImpact
 //===================================================================
 input group "=== GENERAL SETTINGS ==="
 input HCMode Mode                 = MODE_MASTER; // Operation mode
-input bool   PropFirmMode         = true;        // Enable limits guardian (MASTER only)
+input bool   PropFirmMode         = true;        // Enable limits guardian (Master and Slave)
 input double ForceInitialBalance  = 0.0;         // Force initial balance (0 = auto-detect)
-input bool   ResetCountersOnInit  = false;       // Reset counters and locks on init (MASTER only)
+input bool   ResetCountersOnInit  = false;       // Reset counters and locks on init
 
 input group "=== SYNC FILE ==="
 input string FileName             = "master_00001.csv"; // Shared file name (Master and Slave must match; bump 00001 for more)
@@ -68,40 +69,45 @@ input double     RiskMultiplier      = 1.0;       // Lot multiplier (Slave lot =
 input bool       AutoLotScaling      = true;      // Auto-scale lots by point value (contract size differences)
 input int        Slippage            = 10;        // Allowed slippage (points)
 input long       MagicNumber         = 987654;    // Magic Number of the Slave orders
-input double     SlaveTotalProfitLimitPercent = 0.0; // Slave total profit limit (%); 0 = none
 
-input group "=== CLOSE PROPAGATION (Master and Slave) ==="
-input bool PropagateSlaveClose = true; // Slave close (SL/TP/manual/lock) also closes the Master position
+input group "=== PROPAGATION (set the same on Master and Slaves) ==="
+input bool PropagateSlaveClose = true; // Slave closes AND trading locks propagate to the Master
 
-input group "=== EQUITY LIMITS (MASTER mode only) ==="
+// The guardian below runs in BOTH modes. On the Master it gates the order-placing
+// EA (global variable + deletes pendings) and closes positions on breach. On a
+// Slave it does the same on its own account and, with PropagateSlaveClose=true,
+// reports its lock to the Master: the Master only accepts new orders while EVERY
+// account (Master and all Slaves) has trading enabled. Slave breaches that close
+// positions also close the originals on the Master (and so on every other Slave).
+input group "=== EQUITY LIMITS ==="
 input double DailyProfitLimitPercent = 4.6; // Daily profit limit (%); 0 = no limit
 input double DailyLossLimitPercent   = 4.6; // Daily loss limit (%); 0 = no limit
 input double TotalProfitLimitPercent = 8.1; // Total profit limit (%); 0 = no limit
 input double TotalLossLimitPercent   = 8.1; // Total loss limit (%); 0 = no limit
 
-input group "=== TRADING LIMITS (MASTER mode only) ==="
+input group "=== TRADING LIMITS ==="
 input int    MaxParallelTrades      = 1; // Parallel trades limit; 0 = no limit
 input int    MaxTradesPerDay        = 1; // Trades per day limit; 0 = no limit
 input int    MaxConsecLossesPerDay  = 0; // Consecutive losses per day limit; 0 = no limit
 input int    MaxConsecWinsPerDay    = 0; // Consecutive wins per day limit; 0 = no limit
 
-input group "=== DAILY RESET (MASTER mode only) ==="
+input group "=== DAILY RESET ==="
 input int    DailyResetHour   = 0; // Daily reset hour (0-23)
 input int    DailyResetMinute = 0; // Daily reset minute (0-59)
 
-input group "=== TRADING HOURS (MASTER mode only) ==="
+input group "=== TRADING HOURS ==="
 input bool   LimitTradingHours  = true; // Limit new entries to the specified hours
 input int    TradingStartHour   = 6;    // Trading start hour (0-23)
 input int    TradingStartMinute = 0;    // Trading start minute (0-59)
 input int    TradingEndHour     = 20;   // Trading end hour (0-23)
 input int    TradingEndMinute   = 0;    // Trading end minute (0-59)
 
-input group "=== FORCED CLOSE (MASTER mode only) ==="
+input group "=== FORCED CLOSE ==="
 input bool   ForceExitEnabled = true; // Force close at the specified time
 input int    TradingExitHour   = 22;  // Forced close hour (0-23)
 input int    TradingExitMinute = 0;   // Forced close minute (0-59)
 
-input group "=== NEWS PROTECTION (MASTER mode only) ==="
+input group "=== NEWS PROTECTION ==="
 input HCNewsMode   NewsMode       = NEWS_OPERATE;   // News handling mode
 input int          NewsDuration   = 120;            // Protection before and after (seconds)
 input string       NewsCurrencies = "";             // Currencies to watch (e.g. EUR,USD,GBP); empty = chart symbol
@@ -156,8 +162,10 @@ bool TotalLocked                = false; // persistent state of the total lock
 bool DidCloseOrders             = false;
 bool DidClosePositions          = false;
 
-// Slave
-bool SlaveProfitLocked = false;
+// Lock propagation (Slave guardian -> Master)
+bool   IsSlaveLockTradingDisabled = false;    // MASTER: some Slave reports trading disabled
+string g_slaveLockInfo            = "";       // MASTER: which Slave(s)/reason(s), for log + panel
+string g_lastLockWritten          = "<none>"; // SLAVE: last lock state written ("<none>" = unknown)
 
 // Dashboard
 string LastDashboardValues[];
@@ -167,7 +175,6 @@ bool   DashboardNeedsUpdate = true;
 string   LastPositionsHash   = "";
 bool     SyncFileInitialized = false;
 bool     MasterFileExists    = false;
-int      LastSlaveDay        = -1;
 bool     SlaveWarningShown   = false;
 ulong    g_syncSeq           = 0;  // Master: write sequence (monotonic across EA restarts)
 int      g_timerTick         = 0;  // 200 ms timer tick counter (every 5th = ~1 s work)
@@ -239,21 +246,18 @@ int OnInit()
   {
    Print("HCPropsController v2 initialized. Mode: ", (Mode == MODE_MASTER ? "MASTER" : "SLAVE"));
 
-   // Time-range validations (MASTER)
-   if(Mode == MODE_MASTER)
-     {
-      if(DailyResetHour < 0 || DailyResetHour > 23 || DailyResetMinute < 0 || DailyResetMinute > 59)
-        { Print("ERROR: Daily reset out of range"); return INIT_PARAMETERS_INCORRECT; }
-      if(LimitTradingHours &&
-         (TradingStartHour < 0 || TradingStartHour > 23 || TradingStartMinute < 0 || TradingStartMinute > 59 ||
-          TradingEndHour   < 0 || TradingEndHour   > 23 || TradingEndMinute   < 0 || TradingEndMinute   > 59))
-        { Print("ERROR: Trading hours out of range"); return INIT_PARAMETERS_INCORRECT; }
-      if(ForceExitEnabled &&
-         (TradingExitHour < 0 || TradingExitHour > 23 || TradingExitMinute < 0 || TradingExitMinute > 59))
-        { Print("ERROR: Forced close out of range"); return INIT_PARAMETERS_INCORRECT; }
-      if(NewsMode != NEWS_OPERATE && NewsDuration < 0)
-        { Print("ERROR: NewsDuration must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
-     }
+   // Time-range validations (the guardian runs in BOTH modes)
+   if(DailyResetHour < 0 || DailyResetHour > 23 || DailyResetMinute < 0 || DailyResetMinute > 59)
+     { Print("ERROR: Daily reset out of range"); return INIT_PARAMETERS_INCORRECT; }
+   if(LimitTradingHours &&
+      (TradingStartHour < 0 || TradingStartHour > 23 || TradingStartMinute < 0 || TradingStartMinute > 59 ||
+       TradingEndHour   < 0 || TradingEndHour   > 23 || TradingEndMinute   < 0 || TradingEndMinute   > 59))
+     { Print("ERROR: Trading hours out of range"); return INIT_PARAMETERS_INCORRECT; }
+   if(ForceExitEnabled &&
+      (TradingExitHour < 0 || TradingExitHour > 23 || TradingExitMinute < 0 || TradingExitMinute > 59))
+     { Print("ERROR: Forced close out of range"); return INIT_PARAMETERS_INCORRECT; }
+   if(NewsMode != NEWS_OPERATE && NewsDuration < 0)
+     { Print("ERROR: NewsDuration must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
 
    // SLAVE validation: needs a shared file name to read from
    if(Mode == MODE_SLAVE)
@@ -267,71 +271,62 @@ int OnInit()
 
    CalculateAccountDepositsAndWithdrawals();
 
-   if(Mode == MODE_MASTER)
+   // ---- Guardian init (both modes; on the Slave it protects its own account) ----
+   // Reset persistent state if requested
+   if(ResetCountersOnInit)
      {
-      // Reset persistent state if requested
-      if(ResetCountersOnInit)
-        {
-         GlobalVariableDel(GV_TOTAL_LOCK);
-         GlobalVariableDel(GV_DAILY_LOCK);
-         GlobalVariableDel(GV_INIT_BAL);
-         GlobalVariableDel(GV_INIT_EQD);
-         GlobalVariableDel(GV_NEXT_RESET);
-         EnableTrading();
-         Print("ResetCountersOnInit: state cleared");
-        }
-
-      // Restore baseline + locks from GlobalVariables (survives restarts/VPS crashes)
-      bool restored = false;
-      if(PropFirmMode && !ResetCountersOnInit && GlobalVariableCheck(GV_INIT_BAL))
-        {
-         if(GlobalVariableGet(GV_INIT_BAL) > 0)
-            AccountDepositsAndWithdrawals = GlobalVariableGet(GV_INIT_BAL);
-         InitialEquityDaily = GlobalVariableGet(GV_INIT_EQD);
-         NextDailyResetTime = (datetime)GlobalVariableGet(GV_NEXT_RESET);
-         TotalLocked = (GlobalVariableCheck(GV_TOTAL_LOCK) && GlobalVariableGet(GV_TOTAL_LOCK) == 1.0);
-         IsDailyLimitTradingDisabled = (GlobalVariableCheck(GV_DAILY_LOCK) && GlobalVariableGet(GV_DAILY_LOCK) == 1.0);
-         restored = (InitialEquityDaily > 0 && NextDailyResetTime > 0);
-         if(restored)
-            Print("State restored from GlobalVariables. TotalLocked=", TotalLocked, " InitEquityDaily=", InitialEquityDaily);
-        }
-
-      if(!restored)
-        {
-         CalculateInitialEquityDaily();
-         CalculateNextDailyResetTime();
-        }
-
-      CalculateTotalLimits();
-      CalculateDailyLimits();
-      if(ForceExitEnabled)
-         CalculateNextForceExitTime();
-
-      Sleep(100);
-      CountTradesOpenedToday();
-      CountCurrentTrades();
-      CountConsecutiveWinsLosses();
-
-      // If the reset time passed while the EA was off, reset now
-      if(restored && TimeCurrent() >= NextDailyResetTime)
-         PerformDailyReset();
-
-      PersistState();
-
-      if(PropFirmMode)
-         CheckGuardRules();
-      CheckNews();
-
-      Print("MASTER OnInit: PropFirmMode=", PropFirmMode, " TradesToday=", TradesOpenedToday, "/", MaxTradesPerDay);
+      GlobalVariableDel(GV_TOTAL_LOCK);
+      GlobalVariableDel(GV_DAILY_LOCK);
+      GlobalVariableDel(GV_INIT_BAL);
+      GlobalVariableDel(GV_INIT_EQD);
+      GlobalVariableDel(GV_NEXT_RESET);
+      EnableTrading();
+      Print("ResetCountersOnInit: state cleared");
      }
-   else // SLAVE
+
+   // Restore baseline + locks from GlobalVariables (survives restarts/VPS crashes)
+   bool restored = false;
+   if(PropFirmMode && !ResetCountersOnInit && GlobalVariableCheck(GV_INIT_BAL))
      {
-      CalculateInitialEquityDailySlave();
-      MqlDateTime ct; TimeToStruct(TimeCurrent(), ct);
-      LastSlaveDay = ct.day;
-      CalculateTotalLimits();
-      CalculateDailyLimits();
+      if(GlobalVariableGet(GV_INIT_BAL) > 0)
+         AccountDepositsAndWithdrawals = GlobalVariableGet(GV_INIT_BAL);
+      InitialEquityDaily = GlobalVariableGet(GV_INIT_EQD);
+      NextDailyResetTime = (datetime)GlobalVariableGet(GV_NEXT_RESET);
+      TotalLocked = (GlobalVariableCheck(GV_TOTAL_LOCK) && GlobalVariableGet(GV_TOTAL_LOCK) == 1.0);
+      IsDailyLimitTradingDisabled = (GlobalVariableCheck(GV_DAILY_LOCK) && GlobalVariableGet(GV_DAILY_LOCK) == 1.0);
+      restored = (InitialEquityDaily > 0 && NextDailyResetTime > 0);
+      if(restored)
+         Print("State restored from GlobalVariables. TotalLocked=", TotalLocked, " InitEquityDaily=", InitialEquityDaily);
      }
+
+   if(!restored)
+     {
+      CalculateInitialEquityDaily();
+      CalculateNextDailyResetTime();
+     }
+
+   CalculateTotalLimits();
+   CalculateDailyLimits();
+   if(ForceExitEnabled)
+      CalculateNextForceExitTime();
+
+   Sleep(100);
+   CountTradesOpenedToday();
+   CountCurrentTrades();
+   CountConsecutiveWinsLosses();
+
+   // If the reset time passed while the EA was off, reset now
+   if(restored && TimeCurrent() >= NextDailyResetTime)
+      PerformDailyReset();
+
+   PersistState();
+
+   if(PropFirmMode)
+      CheckGuardRules();
+   CheckNews();
+
+   Print((Mode == MODE_MASTER ? "MASTER" : "SLAVE"), " OnInit: PropFirmMode=", PropFirmMode,
+         " TradesToday=", TradesOpenedToday, "/", MaxTradesPerDay);
 
    // 200 ms timer: fast Slave reaction / close-request processing.
    // Heavy 1-second work runs on every 5th tick (see OnTimer).
@@ -363,6 +358,7 @@ int OnInit()
          Print("SLAVE: check that FileName matches the Master's FileName exactly.");
          SlaveWarningShown = true;
         }
+      UpdateSlaveLockStatusFile(); // publish (or clear) our lock state right away
      }
 
    return INIT_SUCCEEDED;
@@ -373,7 +369,7 @@ int OnInit()
 //===================================================================
 void PersistState()
   {
-   if(Mode != MODE_MASTER || !PropFirmMode)
+   if(!PropFirmMode)
       return;
    GlobalVariableSet(GV_INIT_BAL,   AccountDepositsAndWithdrawals);
    GlobalVariableSet(GV_INIT_EQD,   InitialEquityDaily);
@@ -419,32 +415,6 @@ void CalculateInitialEquityDaily()
    CAccountInfo acc;
    double currentBalance = acc.Balance();
    if(!HistorySelect(lastReset + 1, TimeCurrent()))
-     { InitialEquityDaily = AccountDepositsAndWithdrawals; return; }
-
-   int total = HistoryDealsTotal();
-   double change = 0.0;
-   CDealInfo deal;
-   for(int i = 0; i < total; i++)
-      if(deal.SelectByIndex(i))
-         change += deal.Profit() + deal.Commission() + deal.Swap();
-
-   InitialEquityDaily = currentBalance - change;
-   if(InitialEquityDaily <= 0.0 && currentBalance > 0.0 && AccountDepositsAndWithdrawals > 0.0)
-      InitialEquityDaily = currentBalance;
-  }
-
-//===================================================================
-// DAILY INITIAL EQUITY (SLAVE, midnight)
-//===================================================================
-void CalculateInitialEquityDailySlave()
-  {
-   MqlDateTime ct; TimeToStruct(TimeCurrent(), ct);
-   ct.hour = 0; ct.min = 0; ct.sec = 0;
-   datetime midnight = StructToTime(ct);
-
-   CAccountInfo acc;
-   double currentBalance = acc.Balance();
-   if(!HistorySelect(midnight + 1, TimeCurrent()))
      { InitialEquityDaily = AccountDepositsAndWithdrawals; return; }
 
    int total = HistoryDealsTotal();
@@ -595,11 +565,28 @@ void PerformDailyReset()
 //===================================================================
 // TRADING STATE (enable/disable + closes)
 //===================================================================
+// Human-readable list of the active locks (dashboard, lock file, close reasons)
+string ActiveLockFlags()
+  {
+   string flags = "";
+   if(IsGlobalTradingDisabled)      flags += "Total ";
+   if(IsDailyLimitTradingDisabled)  flags += "Daily ";
+   if(IsDailyNumberTradingDisabled) flags += "Trades/Day ";
+   if(IsParallelTradesDisabled)     flags += "Parallel ";
+   if(IsConsecWinsDisabled)         flags += "WinsStreak ";
+   if(IsConsecLossesDisabled)       flags += "LossStreak ";
+   if(IsTradingHoursDisabled)       flags += "Hours ";
+   if(IsNewsBlocked)                flags += "News ";
+   if(IsSlaveLockTradingDisabled)   flags += "SlaveLock ";
+   StringTrimRight(flags);
+   return flags;
+  }
+
 void CheckAndUpdateTradingStatus()
   {
    bool anyBlock = IsGlobalTradingDisabled || IsDailyLimitTradingDisabled || IsDailyNumberTradingDisabled ||
                    IsParallelTradesDisabled || IsTradingHoursDisabled || IsConsecWinsDisabled ||
-                   IsConsecLossesDisabled || IsNewsBlocked;
+                   IsConsecLossesDisabled || IsNewsBlocked || IsSlaveLockTradingDisabled;
 
    if(!anyBlock)
      {
@@ -612,6 +599,7 @@ void CheckAndUpdateTradingStatus()
    DisableTrading();
 
    // Flatten EVERYTHING for: equity/total limits, consecutive win/loss streaks, or CLOSE_ALL news.
+   // (a Slave lock on the Master only blocks new entries: position closes arrive via close requests)
    bool closeActivePositions = IsGlobalTradingDisabled || IsDailyLimitTradingDisabled ||
                                IsConsecWinsDisabled || IsConsecLossesDisabled ||
                                (IsNewsBlocked && NewsMode == NEWS_CLOSE_ALL);
@@ -620,7 +608,13 @@ void CheckAndUpdateTradingStatus()
      {
       DidCloseOrders = true;
       if(closeActivePositions)
+        {
          DidClosePositions = true;
+         // SLAVE breach that flattens: ask the Master to close the originals first,
+         // so the Master and every other Slave flatten too.
+         if(Mode == MODE_SLAVE && PropagateSlaveClose)
+            EnqueueAllReplicatedCloses("GUARD:" + ActiveLockFlags());
+        }
       CloseAllPositions(closeActivePositions);
      }
 
@@ -657,7 +651,7 @@ void CheckTradingHours()
 //===================================================================
 void CheckGuardRules()
   {
-   if(Mode != MODE_MASTER || !PropFirmMode)
+   if(!PropFirmMode)
       return;
 
    CAccountInfo acc;
@@ -789,9 +783,6 @@ bool InNewsWindow()
 
 void CheckNews()
   {
-   if(Mode != MODE_MASTER)
-      return;
-
    // Refresh the calendar once per hour (and on first startup)
    if(NewsMode != NEWS_OPERATE && (g_lastNewsFetch == 0 || TimeCurrent() - g_lastNewsFetch >= 3600))
      {
@@ -818,66 +809,47 @@ void OnTimer()
    g_timerTick++;
    bool fullTick = (g_timerTick % 5 == 0); // timer runs at 200 ms; ~1 s cadence for heavy work
 
+   // ---- every 200 ms: the fast paths ----
    if(Mode == MODE_MASTER)
+      ProcessCloseRequests();   // honor Slave close requests fast
+   else
      {
-      ProcessCloseRequests(); // every tick: honor Slave close requests fast
+      SlaveSync();              // replicate / reconcile
+      FlushCloseRequests();     // retried every tick until the request file is written
+     }
 
-      if(!fullTick)
-         return;
+   if(!fullTick)
+      return;
 
-      if(PropFirmMode)
+   // ---- ~1 s: guardian, news, status propagation, dashboard (both modes) ----
+   if(Mode == MODE_MASTER)
+      CheckSlaveLocks(); // read Slave lock files BEFORE evaluating the trading status
+
+   if(PropFirmMode)
+     {
+      if(TimeCurrent() >= NextDailyResetTime)
+         PerformDailyReset();
+
+      if(ForceExitEnabled && NextForceExitTime > 0 && TimeCurrent() >= NextForceExitTime)
         {
-         if(TimeCurrent() >= NextDailyResetTime)
-            PerformDailyReset();
-
-         if(ForceExitEnabled && NextForceExitTime > 0 && TimeCurrent() >= NextForceExitTime)
-           {
-            CloseAllPositions(true);
-            CalculateNextForceExitTime();
-            Print("Forced close executed. Next: ", TimeToString(NextForceExitTime));
-           }
-
-         CheckGuardRules();
+         if(Mode == MODE_SLAVE && PropagateSlaveClose)
+            EnqueueAllReplicatedCloses("FORCE_EXIT"); // flatten the Master legs too
+         CloseAllPositions(true);
+         CalculateNextForceExitTime();
+         Print("Forced close executed. Next: ", TimeToString(NextForceExitTime));
         }
 
-      CheckNews();        // also manages trading state when PropFirmMode=false
+      CheckGuardRules();
+     }
+
+   CheckNews();        // also manages trading state when PropFirmMode=false
+
+   if(Mode == MODE_MASTER)
       SyncPositionsToFile();
-      UpdateDashboard();
-     }
-   else // SLAVE
-     {
-      if(fullTick)
-        {
-         MqlDateTime ct; TimeToStruct(TimeCurrent(), ct);
-         if(LastSlaveDay != ct.day)
-           {
-            CalculateInitialEquityDailySlave();
-            LastSlaveDay = ct.day;
-            DashboardNeedsUpdate = true;
-           }
+   else
+      UpdateSlaveLockStatusFile(); // publish lock state changes to the Master
 
-         // Slave profit limit
-         if(SlaveTotalProfitLimitPercent > 0 && !SlaveProfitLocked)
-           {
-            CAccountInfo acc;
-            double cap = AccountDepositsAndWithdrawals * (1.0 + SlaveTotalProfitLimitPercent / 100.0);
-            if(AccountDepositsAndWithdrawals > 0 && acc.Equity() >= cap)
-              {
-               SlaveProfitLocked = true;
-               if(PropagateSlaveClose)
-                  EnqueueAllReplicatedCloses("PROFIT_LOCK"); // Master (and the other Slaves) follow
-               CloseAllPositions(true);
-               Print("SLAVE: profit limit reached (", SlaveTotalProfitLimitPercent, "%). Replication stopped.");
-              }
-           }
-        }
-
-      if(!SlaveProfitLocked)
-         SlaveSync();
-      FlushCloseRequests(); // retried every tick until the request file is written
-      if(fullTick)
-         UpdateDashboard();
-     }
+   UpdateDashboard();
   }
 
 //===================================================================
@@ -887,70 +859,63 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
   {
-   if(Mode == MODE_MASTER)
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
      {
-      if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+      HistorySelect(0, TimeCurrent());
+      bool ok = HistoryDealSelect(trans.deal);
+      int retry = 0;
+      while(!ok && retry < 3) { Sleep(10); HistorySelect(0, TimeCurrent()); ok = HistoryDealSelect(trans.deal); retry++; }
+
+      // Counters feed the guardian in BOTH modes
+      if(ok)
         {
-         HistorySelect(0, TimeCurrent());
-         bool ok = HistoryDealSelect(trans.deal);
-         int retry = 0;
-         while(!ok && retry < 3) { Sleep(10); HistorySelect(0, TimeCurrent()); ok = HistoryDealSelect(trans.deal); retry++; }
-
-         if(ok)
-           {
-            CDealInfo deal; deal.Ticket(trans.deal);
-            if(deal.Entry() == DEAL_ENTRY_IN)
-               CountTradesOpenedToday();
-            else if(deal.Entry() == DEAL_ENTRY_OUT)
-              {
-               Sleep(10);
-               CountConsecutiveWinsLosses();
-               DashboardNeedsUpdate = true;
-              }
-           }
-         else
+         CDealInfo deal; deal.Ticket(trans.deal);
+         if(deal.Entry() == DEAL_ENTRY_IN)
             CountTradesOpenedToday();
-
-         CountCurrentTrades();
-         if(PropFirmMode)
-            CheckGuardRules();
-         SyncPositionsToFile();
+         else if(deal.Entry() == DEAL_ENTRY_OUT)
+           {
+            Sleep(10);
+            CountConsecutiveWinsLosses();
+            DashboardNeedsUpdate = true;
+           }
         }
+      else
+         CountTradesOpenedToday();
 
-      if(trans.type == TRADE_TRANSACTION_POSITION)
+      CountCurrentTrades();
+      if(PropFirmMode)
+         CheckGuardRules();
+
+      if(Mode == MODE_MASTER)
          SyncPositionsToFile();
-      return;
+      else if(ok)
+         SlavePropagateCloseFromDeal(trans.deal);
      }
 
-   // ---- SLAVE: detect broker/user-initiated closes of mirrored positions ----
-   // When the Slave's own SL/TP (or a manual close / stop out) closes a mirrored
-   // position while the Master still holds it, ask the Master to close it too,
-   // so the Master and every other Slave flatten immediately.
+   if(trans.type == TRADE_TRANSACTION_POSITION && Mode == MODE_MASTER)
+      SyncPositionsToFile();
+  }
+
+// SLAVE: when our own SL/TP (or a manual close / stop out) closes a mirrored
+// position while the Master still holds it, ask the Master to close it too,
+// so the Master and every other Slave flatten immediately.
+void SlavePropagateCloseFromDeal(ulong dealTicket)
+  {
    if(!PropagateSlaveClose)
       return;
-   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+   if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != MagicNumber)
       return;
-
-   HistorySelect(0, TimeCurrent());
-   bool ok = HistoryDealSelect(trans.deal);
-   int retry = 0;
-   while(!ok && retry < 3) { Sleep(10); HistorySelect(0, TimeCurrent()); ok = HistoryDealSelect(trans.deal); retry++; }
-   if(!ok)
-      return;
-
-   if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != MagicNumber)
-      return;
-   ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
    if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
       return;
-   ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(trans.deal, DEAL_REASON);
-   // DEAL_REASON_EXPERT = our own sync close (Master already flat) -> never propagate.
+   ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(dealTicket, DEAL_REASON);
+   // DEAL_REASON_EXPERT = our own sync/guardian close (already propagated or Master-initiated).
    bool propagate = (reason == DEAL_REASON_SL || reason == DEAL_REASON_TP || reason == DEAL_REASON_SO ||
                      reason == DEAL_REASON_CLIENT || reason == DEAL_REASON_MOBILE || reason == DEAL_REASON_WEB);
    if(!propagate)
       return;
 
-   ulong posId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+   ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
    if(posId == 0)
       return;
    if(PositionSelectByTicket(posId))
@@ -1426,6 +1391,20 @@ void FlushCloseRequests()
    ArrayResize(g_closeReqReason, 0);
   }
 
+// Folder part of the sync path (FileFindFirst returns bare names)
+string SyncFolder()
+  {
+   string base = GetSyncFilePath();
+   string parts[];
+   int np = StringSplit(base, '\\', parts);
+   if(np <= 1)
+      return "";
+   string folder = parts[0];
+   for(int i = 1; i < np - 1; i++)
+      folder += "\\" + parts[i];
+   return folder;
+  }
+
 // MASTER: poll <syncfile>.close.* every 200 ms and close the requested tickets.
 // The resulting DEAL_ADD transactions rewrite the sync file, so every other
 // Slave flattens on its next tick.
@@ -1434,18 +1413,8 @@ void ProcessCloseRequests()
    if(Mode != MODE_MASTER || !PropagateSlaveClose)
       return;
 
-   string base = GetSyncFilePath();
-
-   // Folder part of the sync path (FileFindFirst returns bare names)
-   string folder = "";
-   string parts[];
-   int np = StringSplit(base, '\\', parts);
-   if(np > 1)
-     {
-      folder = parts[0];
-      for(int i = 1; i < np - 1; i++)
-         folder += "\\" + parts[i];
-     }
+   string base   = GetSyncFilePath();
+   string folder = SyncFolder();
 
    string found;
    long fh = FileFindFirst(base + ".close.*", found, FILE_COMMON);
@@ -1501,6 +1470,106 @@ void ProcessCloseRequests()
 
    if(closedAny)
       SyncPositionsToFile();
+  }
+
+//-------------------------------------------------------------------
+// Lock propagation: Slave guardian state -> Master
+// A Slave with trading disabled writes <syncfile>.lock.<login> (content =
+// the active lock flags). The Master blocks new entries while ANY lock
+// file exists: orders are only accepted when EVERY account is enabled.
+//-------------------------------------------------------------------
+string LockFilePath()
+  {
+   return GetSyncFilePath() + ".lock." + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+  }
+
+// SLAVE (~1 s): keep the lock file in sync with our own guardian state.
+void UpdateSlaveLockStatusFile()
+  {
+   if(Mode != MODE_SLAVE)
+      return;
+
+   string rel    = LockFilePath();
+   bool   locked = PropagateSlaveClose && TradingIsDisabled();
+
+   if(locked)
+     {
+      string reason = ActiveLockFlags();
+      if(reason == "")
+         reason = "LOCKED";
+      if(g_lastLockWritten == reason && FileIsExist(rel, FILE_COMMON))
+         return;
+      int h = FileOpen(rel, FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_SHARE_READ, ',');
+      if(h == INVALID_HANDLE)
+         return; // retry on the next full tick
+      FileWrite(h, reason);
+      FileClose(h);
+      if(g_lastLockWritten != reason)
+         Print("SLAVE: trading locked (", reason, ") -> Master notified: new entries blocked everywhere");
+      g_lastLockWritten = reason;
+     }
+   else
+     {
+      if(FileIsExist(rel, FILE_COMMON))
+        {
+         FileDelete(rel, FILE_COMMON);
+         Print("SLAVE: trading enabled again -> Master lock released");
+        }
+      g_lastLockWritten = "";
+     }
+  }
+
+// MASTER (~1 s): any <syncfile>.lock.* present -> block new entries.
+void CheckSlaveLocks()
+  {
+   if(Mode != MODE_MASTER)
+      return;
+
+   bool was = IsSlaveLockTradingDisabled;
+   IsSlaveLockTradingDisabled = false;
+   g_slaveLockInfo = "";
+
+   if(!PropagateSlaveClose)
+      return;
+
+   string base   = GetSyncFilePath();
+   string folder = SyncFolder();
+
+   string found;
+   long fh = FileFindFirst(base + ".lock.*", found, FILE_COMMON);
+   if(fh == INVALID_HANDLE)
+     {
+      if(was)
+         Print("MASTER: all Slave locks released. New entries allowed again.");
+      return;
+     }
+   do
+     {
+      string rel = (folder == "") ? found : folder + "\\" + found;
+      string login = "";
+      int p = StringFind(found, ".lock.");
+      if(p >= 0)
+         login = StringSubstr(found, p + 6);
+      string reason = "";
+      int h = FileOpen(rel, FILE_READ | FILE_CSV | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE, ',');
+      if(h != INVALID_HANDLE)
+        {
+         if(!FileIsEnding(h))
+            reason = FileReadString(h);
+         FileClose(h);
+        }
+      IsSlaveLockTradingDisabled = true;
+      if(g_slaveLockInfo != "")
+         g_slaveLockInfo += " | ";
+      g_slaveLockInfo += login + (reason != "" ? " (" + reason + ")" : "");
+     }
+   while(FileFindNext(fh, found));
+   FileFindClose(fh);
+
+   if(IsSlaveLockTradingDisabled && !was)
+      Print("MASTER: Slave reports trading disabled -> blocking new entries. [", g_slaveLockInfo, "]");
+
+   DashboardNeedsUpdate = (was != IsSlaveLockTradingDisabled) || DashboardNeedsUpdate;
   }
 
 //-------------------------------------------------------------------
@@ -1848,6 +1917,20 @@ void ReconcileSlavePositions()
       if(OpenRecentlyTried(g_targets[t].masterTicket))
          continue;
 
+      // Guardian lock on this Slave: never replicate NEW positions while locked.
+      // A Master position can only appear here through the lock-propagation race
+      // window (or mismatched settings) - ask the Master to close it so the
+      // "all accounts enabled or no new trades" invariant holds.
+      if(TradingIsDisabled())
+        {
+         if(PropagateSlaveClose)
+            EnqueueMasterClose(g_targets[t].masterTicket, "SLAVE_LOCKED:" + ActiveLockFlags());
+         else
+            Print("SLAVE: trading locked (", ActiveLockFlags(), ") - NOT replicating Master #",
+                  g_targets[t].masterTicket);
+         continue;
+        }
+
       string sym = g_targets[t].symbol;
       if(!SymbolSelect(sym, true))
         { Print("SLAVE: symbol not available at the broker: ", sym); continue; }
@@ -1968,19 +2051,36 @@ void SizePanel(int yPos)
 
 void UpdateDashboard()
   {
-   if(Mode == MODE_SLAVE) { UpdateDashboardSlave(); return; }
-
    CAccountInfo acc;
    double eq = acc.Equity();
    int y = 20, lh = 20;
 
    CreateOrUpdateLabel("HCProps_Title", 20, y, "=== HC Props Controller ===", clrDodgerBlue, 12, true, 0); y += lh + 5;
-   string modeText = PropFirmMode ? "MASTER (guardian ON)" : "MASTER (sync only)";
+   string modeText;
+   if(Mode == MODE_MASTER)
+      modeText = PropFirmMode ? "MASTER (guardian ON)" : "MASTER (sync only)";
+   else
+      modeText = PropFirmMode ? "SLAVE (guardian ON)" : "SLAVE (copy only)";
    CreateOrUpdateLabel("HCProps_Mode", 20, y, "Mode: " + modeText, clrYellow, 11, true, 1); y += lh + 3;
    CreateOrUpdateLabel("HCProps_File", 20, y, "File: " + SyncFileLabel(), clrAqua, 10, false, 2); y += lh + 5;
 
+   if(Mode == MODE_SLAVE)
+     {
+      CreateOrUpdateLabel("HCProps_Rev", 20, y, "Invert: " + (InverseMode ? "YES" : "NO") +
+                          " | Mult: " + DoubleToString(RiskMultiplier, 2) +
+                          (AutoLotScaling ? " | AutoLots" : "") +
+                          " | " + (CopyMode == COPY_NORMAL ? "NORMAL" : "INCOGNITO"), clrAqua, 9, false, 3); y += lh;
+      string mst = MasterFileExists ? "CONNECTED" : "WAITING FOR MASTER";
+      CreateOrUpdateLabel("HCProps_MStatus", 20, y, "Master Status: " + mst, MasterFileExists ? clrLime : clrOrange, 11, true, 21); y += lh + 3;
+     }
+
    string status = TradingIsDisabled() ? "DISABLED" : "ENABLED";
    CreateOrUpdateLabel("HCProps_Status", 20, y, "Trading Status: " + status, TradingIsDisabled() ? clrRed : clrLime, 11, true, 4); y += lh;
+
+   if(Mode == MODE_MASTER && IsSlaveLockTradingDisabled)
+     { CreateOrUpdateLabel("HCProps_SlaveLock", 20, y, "SLAVE LOCK: " + g_slaveLockInfo, clrRed, 9, true, 22); y += lh; }
+   else
+     { ObjectDelete(0, "HCProps_SlaveLock"); LastDashboardValues[22] = ""; }
 
    if(IsNewsBlocked)
      { CreateOrUpdateLabel("HCProps_News", 20, y, "NEWS ACTIVE: " + g_activeNews, clrRed, 10, true, 5); y += lh; }
@@ -1991,14 +2091,7 @@ void UpdateDashboard()
 
    if(PropFirmMode)
      {
-      string flags = "";
-      if(IsGlobalTradingDisabled) flags += "Total ";
-      if(IsDailyLimitTradingDisabled) flags += "Daily ";
-      if(IsDailyNumberTradingDisabled) flags += "Trades/Day ";
-      if(IsParallelTradesDisabled) flags += "Parallel ";
-      if(IsConsecWinsDisabled) flags += "WinsStreak ";
-      if(IsConsecLossesDisabled) flags += "LossStreak ";
-      if(IsTradingHoursDisabled) flags += "Hours ";
+      string flags = ActiveLockFlags();
       if(flags == "") flags = "None";
       CreateOrUpdateLabel("HCProps_FlagsList", 20, y, "Locks: " + flags, flags == "None" ? clrLime : clrOrange, 9, false, 6); y += lh + 5;
 
@@ -2054,26 +2147,6 @@ void UpdateDashboard()
    ChartRedraw(0);
   }
 
-void UpdateDashboardSlave()
-  {
-   CAccountInfo acc;
-   int y = 20, lh = 20;
-   CreateOrUpdateLabel("HCProps_Title", 20, y, "=== HC Props Controller ===", clrDodgerBlue, 12, true, 0); y += lh + 5;
-   CreateOrUpdateLabel("HCProps_Mode", 20, y, "Mode: SLAVE", clrYellow, 11, true, 1); y += lh + 3;
-   CreateOrUpdateLabel("HCProps_File", 20, y, "File: " + SyncFileLabel(), clrAqua, 10, false, 2); y += lh;
-   CreateOrUpdateLabel("HCProps_Rev", 20, y, "Invert: " + (InverseMode ? "YES" : "NO") + " | Mult: " + DoubleToString(RiskMultiplier, 2) + " | " + (CopyMode == COPY_NORMAL ? "NORMAL" : "INCOGNITO"), clrAqua, 9, false, 4); y += lh + 5;
-   string st = MasterFileExists ? "CONNECTED" : "WAITING FOR MASTER";
-   CreateOrUpdateLabel("HCProps_MStatus", 20, y, "Master Status: " + st, MasterFileExists ? clrLime : clrOrange, 11, true, 5); y += lh;
-   if(SlaveProfitLocked)
-     { CreateOrUpdateLabel("HCProps_SLock", 20, y, "PROFIT LOCK: replication stopped", clrRed, 10, true, 6); y += lh; }
-   else
-     { ObjectDelete(0, "HCProps_SLock"); LastDashboardValues[6] = ""; } // no empty label stacked on "Equity:"
-   CreateOrUpdateLabel("HCProps_SEq", 20, y, "Equity: " + DoubleToString(acc.Equity(), 2), clrWhite, 10, false, 7); y += lh;
-   SizePanel(y);
-   DashboardNeedsUpdate = false;
-   ChartRedraw(0);
-  }
-
 void DeleteDashboard()
   {
    ObjectsDeleteAll(0, "HCProps_");
@@ -2106,6 +2179,19 @@ void OnDeinit(const int reason)
       // If the EA is removed for good (not a recompile), release the lock signal.
       if(reason == REASON_REMOVE || reason == REASON_CHARTCLOSE)
          EnableTrading();
+     }
+   else // SLAVE
+     {
+      // Removed for good: release the Master from this Slave's lock. On a mere
+      // recompile/restart the file stays put so the Master remains protected
+      // (it is re-reconciled within a second of the Slave coming back).
+      if(reason == REASON_REMOVE || reason == REASON_CHARTCLOSE)
+        {
+         string lockRel = LockFilePath();
+         if(FileIsExist(lockRel, FILE_COMMON))
+            FileDelete(lockRel, FILE_COMMON);
+         EnableTrading();
+        }
      }
   }
 //+------------------------------------------------------------------+

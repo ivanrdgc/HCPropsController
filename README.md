@@ -46,7 +46,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 
 ## Features at a Glance
 
-- **Prop-firm risk guardian** — daily and total profit/loss limits, max parallel trades, max trades per day, consecutive win/loss streak limits, trading-hours window, and a forced close time. When a limit is hit it closes positions, deletes pending orders, and disables trading.
+- **Prop-firm risk guardian (Master AND Slave)** — daily and total profit/loss limits, max parallel trades, max trades per day, consecutive win/loss streak limits, trading-hours window, and a forced close time, enforced independently on every account. When a limit is hit it closes positions, deletes pending orders, and disables trading. With `PropagateSlaveClose`, a Slave breach also closes the originals on the Master and **locks the Master**: new orders are only accepted while *every* account has trading enabled.
 - **Copy trading** — replicate one MASTER account onto any number of SLAVE accounts on the same machine, with auto lot scaling by point value, lot multiplier, symbol mapping, inverse mode, distance-based SL/TP (measured from each account's own fill price), and Slave→Master close propagation (a Slave-side SL/TP/manual close flattens the Master and every other Slave within ~half a second).
 - **News filter** — pause or close trading around economic news using MT5's native economic calendar (fully offline).
 - **Live information panel** — an on-chart dashboard showing status, limits, counters, schedules, and connection state.
@@ -86,11 +86,13 @@ Go to the [**Releases**](https://github.com/ivanrdgc/HCPropsController/releases)
 
 #### 🔴 MASTER mode (primary account)
 
-The EA executes/monitors trading on this account, enforces the risk limits (when `PropFirmMode` is on), runs the news filter, and writes a shared file describing its open positions so Slaves can copy them.
+Meant to run **together with another EA that places the orders**. HCPropsController monitors the account, enforces the risk limits (when `PropFirmMode` is on), runs the news filter, gates the order-placing EA through the `HCPropsControllerDisableTrading` global variable, and writes a shared file describing its open positions so Slaves can copy them.
 
 #### 🔵 SLAVE mode (replicating account)
 
-The EA reads the Master's shared file and replicates its positions. It does not enforce prop-firm limits (it only mirrors the Master), except for its own optional total-profit cutoff.
+Meant to run **alone** on its account: HCPropsController itself replicates the Master's positions. Since v2.20 it enforces the **same guardian limits** on its own account (configure them per account — each prop firm has its own rules). The only difference from the Master is who places the orders.
+
+With `PropagateSlaveClose = true` the whole system behaves as one unit: a Slave-side close (SL/TP/manual/breach) closes the original on the Master and every other Slave, and a Slave whose trading is disabled (any lock) disables trading on the Master too — **new orders are only accepted while every account has trading enabled**.
 
 ---
 
@@ -101,7 +103,7 @@ The EA reads the Master's shared file and replicates its positions. It does not 
 | Parameter | Variable | Default | Description |
 |-----------|----------|---------|-------------|
 | Operation mode | `Mode` | `Master (executes trades)` | Select MASTER for this account. |
-| Enable limits guardian | `PropFirmMode` | `true` | `true` = enforce all risk limits. `false` = the Master only mirrors positions to Slaves (pure relay, no intervention in your trading). |
+| Enable limits guardian | `PropFirmMode` | `true` | `true` = enforce all risk limits on this account (works in **both** modes since v2.20). `false` = pure relay/copy, no intervention in your trading. |
 | Force initial balance | `ForceInitialBalance` | `0` | `0` = auto-detect the initial balance from deposits. `>0` = use this fixed value as the initial balance (basis for total/% limits). |
 | Reset counters and locks on init | `ResetCountersOnInit` | `false` | `true` + reinitialize the EA = resets counters, daily initial equity, and **clears the sticky total lock**. Use it when starting a fresh account/challenge. |
 
@@ -113,7 +115,7 @@ The EA reads the Master's shared file and replicates its positions. It does not 
 | Custom path | `CustomFilePath` | `""` | Custom path inside `Common\Files` (optional). |
 | Symbols | `Symbols` | `""` | (MASTER) Comma-separated symbols to replicate (empty = all). E.g. `EURUSD,US30`. |
 
-#### === EQUITY LIMITS (MASTER only) ===
+#### === EQUITY LIMITS (Master and Slave) ===
 
 | Parameter | Variable | Default | Description |
 |-----------|----------|---------|-------------|
@@ -124,7 +126,7 @@ The EA reads the Master's shared file and replicates its positions. It does not 
 
 > Set any limit to `0` to disable it. See [Prop-Firm Guardian](#feature-prop-firm-guardian) for how the limits are calculated.
 
-#### === TRADING LIMITS (MASTER only) ===
+#### === TRADING LIMITS (Master and Slave) ===
 
 | Parameter | Variable | Default | Description |
 |-----------|----------|---------|-------------|
@@ -133,7 +135,7 @@ The EA reads the Master's shared file and replicates its positions. It does not 
 | Consecutive losses per day limit | `MaxConsecLossesPerDay` | `0` | Max consecutive losing trades. `0` = no limit. |
 | Consecutive wins per day limit | `MaxConsecWinsPerDay` | `0` | Max consecutive winning trades. `0` = no limit. |
 
-#### === DAILY RESET (MASTER only) ===
+#### === DAILY RESET (Master and Slave) ===
 
 | Parameter | Variable | Default | Description |
 |-----------|----------|---------|-------------|
@@ -142,7 +144,7 @@ The EA reads the Master's shared file and replicates its positions. It does not 
 
 At the reset time, counters, daily initial equity, and the daily equity lock are reset/recalculated.
 
-#### === TRADING HOURS (MASTER only) ===
+#### === TRADING HOURS (Master and Slave) ===
 
 | Parameter | Variable | Default | Description |
 |-----------|----------|---------|-------------|
@@ -152,14 +154,14 @@ At the reset time, counters, daily initial equity, and the daily equity lock are
 
 Outside the window, new entries are blocked and pending orders are removed; open positions are **not** force-closed by this rule.
 
-#### === FORCED CLOSE (MASTER only) ===
+#### === FORCED CLOSE (Master and Slave) ===
 
 | Parameter | Variable | Default | Description |
 |-----------|----------|---------|-------------|
 | Force close at the specified time | `ForceExitEnabled` | `true` | Enable a daily forced close. |
 | Forced close hour / minute | `TradingExitHour` / `TradingExitMinute` | `22` / `0` | At this time, **all positions are closed** and pending orders deleted. |
 
-#### === NEWS PROTECTION (MASTER only) ===
+#### === NEWS PROTECTION (Master and Slave) ===
 
 See the dedicated [News Filter](#feature-news-filter) section for full details.
 
@@ -210,8 +212,9 @@ A Slave links to its Master purely through the **`FileName`** in the `=== SYNC F
 | Auto lot scaling | `AutoLotScaling` | `true` | Equalizes **money per point** when contract sizes differ between brokers (e.g. an index worth $20/pt on the Slave vs $10/pt on the Master copies at half the lots automatically). Uses the point value the Master writes into the sync file. |
 | Allowed slippage (points) | `Slippage` | `10` | Permitted deviation in points. |
 | Magic Number | `MagicNumber` | `987654` | Magic of the Slave's orders. Must be unique per Slave within the **same** terminal. The EA only manages positions carrying this magic. |
-| Slave total profit limit (%) | `SlaveTotalProfitLimitPercent` | `0.0` | `0` = no limit. When reached, the Slave closes everything and stops replicating (and, with `PropagateSlaveClose`, asks the Master to close the mirrored positions too). |
-| Slave close closes Master | `PropagateSlaveClose` | `true` | If a mirrored position closes on the Slave by its own SL/TP, a manual close, a stop out, or the profit lock, the Slave asks the Master to close the original position immediately — which in turn flattens every other Slave. Set the same value on the Master and all Slaves. |
+| Slave closes/locks propagate | `PropagateSlaveClose` | `true` | Two effects, set the same value on the Master and all Slaves. **Closes:** a mirrored position closed on the Slave by its own SL/TP, a manual close, a stop out, or a guardian breach immediately closes the original on the Master — which in turn flattens every other Slave. **Locks:** while any Slave has trading disabled (any guardian lock), the Master disables trading too, so new orders are only accepted when every account is enabled. |
+
+> The guardian groups (equity limits, trading limits, daily reset, trading hours, forced close, news) apply to the SLAVE as well — configure them with **this account's** prop-firm rules. The old `SlaveTotalProfitLimitPercent` was removed in v2.20: use `TotalProfitLimitPercent` with `PropFirmMode = true` instead.
 
 #### Example SLAVE configuration
 
@@ -234,7 +237,12 @@ Slave close closes Master = true
 
 ## Feature: Prop-Firm Guardian
 
-Active in **MASTER** mode when `PropFirmMode = true`. The guardian continuously monitors the account and enforces every configured limit.
+Active in **both modes** when `PropFirmMode = true` (each account enforces its own configured limits). The guardian continuously monitors the account and enforces every configured limit.
+
+On a **Slave**, two extra things happen when `PropagateSlaveClose = true`:
+
+- A breach that closes positions (equity limits, streaks, `CLOSE_ALL` news, forced close) first asks the **Master** to close the mirrored originals, so the Master and every other Slave flatten with it.
+- While the Slave has **any** lock active, it publishes a lock file that makes the Master disable trading too (`SLAVE LOCK` on the Master's panel). The Master deletes its pending orders and blocks new entries until **every** account is enabled again. A locked Slave also refuses to replicate new positions; if one slips through the race window, it requests the Master to close it.
 
 ### What each limit does when breached
 
@@ -284,17 +292,17 @@ One MASTER account broadcasts its open positions to any number of SLAVE accounts
 - **Inverse trading.** `InverseMode = true` (the default) flips BUY↔SELL and **mirrors** SL/TP around the entry — the Master's TP distance becomes the Slave's SL, and vice versa.
 - **Symbol mapping.** Use `SymbolMapping` (`MAST:SLAV;MAST2:SLAV2`) when broker symbol names differ.
 - **Volume reduction tracking.** If the Master partially closes a position, the Slave reduces its volume to match (reduction only).
-- **Per-Slave profit cutoff.** `SlaveTotalProfitLimitPercent` closes everything and stops the Slave once reached.
+- **Per-Slave guardian.** The Slave runs the full prop-firm guardian on its own account (see [Prop-Firm Guardian](#feature-prop-firm-guardian)); breaches close the Master's originals and lock the Master via `PropagateSlaveClose`.
 
 > **Account type:** designed for **hedging** accounts (and the common case of one position per symbol per account).
 >
-> **News interaction:** the news filter runs on the MASTER. When the Master pauses or closes due to news, the Slaves replicate that automatically on the next sync.
+> **News interaction:** the news filter can run on any account. On the Master, pauses/closes replicate to the Slaves automatically. On a Slave (with `PropagateSlaveClose`), a news lock disables the Master too, and `CLOSE_ALL` closes the originals everywhere.
 
 ---
 
 ## Feature: News Filter
 
-Built into MASTER mode. The EA can pause or close trading around economic news using MetaTrader 5's **native economic calendar** — no email, API, or WebRequest required. It reads the calendar that MetaQuotes already delivers to the terminal.
+Available in both modes. The EA can pause or close trading around economic news using MetaTrader 5's **native economic calendar** — no email, API, or WebRequest required. It reads the calendar that MetaQuotes already delivers to the terminal. (On a Slave, verify the Slave broker serves the calendar too — see `CheckCalendar`.)
 
 ### Modes (`NewsMode`)
 
@@ -325,9 +333,11 @@ The panel shows `NEWS ACTIVE: ...` in red during protection, and `News: watching
 
 The EA draws an on-chart dashboard with everything important. It only redraws the labels that changed, to avoid flicker.
 
-**MASTER panel shows:** mode (guardian on / sync only), the sync **file** in use, trading status (ENABLED/DISABLED), active locks, initial balance, day-start equity, live equity with daily/total %, configured daily/total limits with color bands, trades today / parallel / win & loss streaks vs. their caps, the trading-hours window, news status, the next daily reset, and the forced-close time.
+**Both modes show** (when `PropFirmMode = true`): mode (guardian on / sync- or copy-only), the sync **file** in use, trading status (ENABLED/DISABLED), active locks, initial balance, day-start equity, live equity with daily/total %, configured daily/total limits with color bands, trades today / parallel / win & loss streaks vs. their caps, the trading-hours window, news status, the next daily reset, and the forced-close time.
 
-**SLAVE panel shows:** mode, the sync **file** it reads, invert/multiplier/copy-mode summary, connection status (CONNECTED / WAITING FOR MASTER), profit-lock state, and live equity.
+**SLAVE adds:** invert/multiplier/auto-lots/copy-mode summary and the connection status (CONNECTED / WAITING FOR MASTER).
+
+**MASTER adds:** a red `SLAVE LOCK: <login> (<reason>)` line whenever a Slave's lock is currently disabling the Master.
 
 **Color coding (graded by how close you are to a limit):**
 
@@ -453,9 +463,12 @@ The exit code is `1` if any file errored, `0` otherwise.
   - sets/updates SL/TP as a distance from the Master's entry applied to the Slave's own fill price (re-applied each tick in `NORMAL` mode; in `INCOGNITO` set at open and re-tried only while the position has no levels at all),
   - opens any Master position it does not have yet (tagged with `HC<masterTicket>`; failed opens retry every ~1.5 s).
 - **Close requests (Slave → Master):** with `PropagateSlaveClose = true`, Slave-initiated closes are written to `<syncfile>.close.<slaveLogin>` as `masterTicket,reason` lines. The Master polls `<syncfile>.close.*` every 200 ms, closes the requested tickets, deletes the request files, and rewrites the sync file so the remaining Slaves follow.
+- **Lock files (Slave → Master):** while a Slave's guardian has trading disabled, it maintains `<syncfile>.lock.<slaveLogin>` (content = the active lock flags). The Master checks `<syncfile>.lock.*` every second: any file present → Master trading disabled (new entries blocked, pendings deleted) until all lock files are gone. The file is deleted when the Slave's lock clears, or when the Slave EA is deliberately removed from its chart; if a Slave terminal *crashes* while locked, the Master stays safely locked until the Slave comes back (or you delete the file manually).
 - **Disconnect detection:** the Master deletes its sync file on shutdown; the Slave then shows `WAITING FOR MASTER`. Close requests queued while the Master is offline stay on disk and are processed when it returns.
 
 > **Upgrading from v2.00:** the file format changed — update the EA on the **Master and every Slave at the same time** (an old Slave cannot parse a v2 file and vice versa). If you had set `RiskMultiplier` to compensate for a contract-size difference (e.g. `0.5` because the Slave's index contract is worth twice as much per point), set it **back to `1.0`**: `AutoLotScaling` now handles that per symbol, and a leftover manual multiplier would halve every other symbol's hedge.
+>
+> **Upgrading to v2.20:** the guardian inputs (equity/trading limits, hours, forced close, news) are now **active on Slaves** and load with their defaults the first time the new build attaches. Review every Slave's inputs after updating: either configure that account's actual prop-firm rules, or set `PropFirmMode = false` on the Slave to keep the old copy-only behavior. `SlaveTotalProfitLimitPercent` was removed — use `TotalProfitLimitPercent` instead.
 
 ---
 
@@ -475,6 +488,9 @@ A: With `AutoLotScaling = true` it copies the volume that gives the **same money
 
 **Q: What happens when the Slave's own SL/TP is hit before the Master's?**
 A: With `PropagateSlaveClose = true` (default), the Slave asks the Master to close the original position immediately (the Master polls every 200 ms), and every other Slave flattens as soon as the sync file updates. With `false`, the Slave keeps mirroring the file and would reopen the position on the next change.
+
+**Q: What happens when a Slave hits one of its own limits?**
+A: The Slave's guardian acts on its own account exactly like on the Master (close positions for equity/streak breaches, block entries for count/hours breaches). With `PropagateSlaveClose = true` it also closes the originals on the Master (for closing breaches) and keeps the Master's trading disabled until the Slave's lock clears — so no account ever trades while another is locked.
 
 **Q: Does the news filter work without internet / a server?**
 A: It uses MT5's native calendar (no backend, login, or network requests). Confirm your broker serves it with `CheckCalendar.mq5`. If it doesn't, the news filter won't work on that terminal — leave `NewsMode = OPERATE` and the rest of the EA still works.

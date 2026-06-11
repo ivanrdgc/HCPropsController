@@ -4,7 +4,7 @@
 //|  Single EA, file-based sync on the same VPS. No backend/license. |
 //+------------------------------------------------------------------+
 #property strict
-#property version "2.30"
+#property version "2.31"
 #property description "HCPropsController: Master/Slave copy trading, prop-firm limits and news filter in a single EA."
 #property description "v2.30: Slave heartbeats (dead-Slave detection via ExpectedSlaves), unified Slave status file,"
 #property description "200 ms equity checks, two-Master guard, hedging-account validation, comment-loss-proof"
@@ -202,8 +202,9 @@ int      g_timerTick         = 0;  // 200 ms timer tick counter (every 5th = ~1 
 datetime g_newsTimes[];
 string   g_newsCurr[];
 string   g_newsName[];
-datetime g_lastNewsFetch = 0;
-string   g_activeNews    = "";
+datetime g_lastNewsFetch  = 0;
+string   g_activeNews     = "";
+datetime g_activeNewsEnd  = 0; // end of the currently active protection window
 
 //===================================================================
 // MODULES

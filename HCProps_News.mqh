@@ -70,19 +70,63 @@ void FetchNews()
    Print("NEWS: ", ArraySize(g_newsTimes), " news scheduled (impact>=", (int)NewsMinImpact, ")");
    if(ArraySize(g_newsTimes) == 0)
       Print("NEWS: WARNING protection is enabled but the calendar returned ZERO events - this broker may not serve ",
-            "the MT5 calendar (verify with CheckCalendar). The news filter is effectively INACTIVE!");
+            "the MT5 calendar (check View -> Toolbox -> Calendar). The news filter is effectively INACTIVE!");
+  }
+
+// "in 45m" / "in 2h05m" / "<1m" - minute granularity keeps the panel calm
+string FmtIn(long secs)
+  {
+   if(secs < 60)
+      return "<1m";
+   long m = secs / 60;
+   if(m < 60)
+      return IntegerToString(m) + "m";
+   return IntegerToString(m / 60) + "h" + StringFormat("%02d", (int)(m % 60)) + "m";
+  }
+
+// Indices (into the g_news* arrays) of the next up-to-maxCount events whose
+// protection window has not started yet, sorted by time.
+int NextNewsEvents(int &idx[], int maxCount)
+  {
+   ArrayResize(idx, 0);
+   datetime now = TimeCurrent();
+   int used[];
+   ArrayResize(used, ArraySize(g_newsTimes));
+   ArrayInitialize(used, 0);
+   for(int k = 0; k < maxCount; k++)
+     {
+      int best = -1;
+      for(int i = 0; i < ArraySize(g_newsTimes); i++)
+        {
+         if(used[i] == 1)
+            continue;
+         if(g_newsTimes[i] - NewsDuration <= now)
+            continue; // already started (or past)
+         if(best < 0 || g_newsTimes[i] < g_newsTimes[best])
+            best = i;
+        }
+      if(best < 0)
+         break;
+      used[best] = 1;
+      int n = ArraySize(idx);
+      ArrayResize(idx, n + 1);
+      idx[n] = best;
+     }
+   return ArraySize(idx);
   }
 
 // Returns true if we are inside the window of any news event
 bool InNewsWindow()
   {
    g_activeNews = "";
+   g_activeNewsEnd = 0;
    datetime now = TimeCurrent();
    for(int i = 0; i < ArraySize(g_newsTimes); i++)
      {
       if(now >= g_newsTimes[i] - NewsDuration && now <= g_newsTimes[i] + NewsDuration)
         {
-         g_activeNews = g_newsCurr[i] + " " + g_newsName[i];
+         g_activeNews    = g_newsCurr[i] + " " + g_newsName[i];
+         g_activeNewsEnd = g_newsTimes[i] + NewsDuration;
          return true;
         }
      }

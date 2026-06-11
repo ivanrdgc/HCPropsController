@@ -22,7 +22,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 - [Feature: News Filter](#feature-news-filter)
 - [Feature: Information Panel](#feature-information-panel)
 - [Feature: Crash-Safe State Persistence](#feature-crash-safe-state-persistence)
-- [Tool: Calendar Checker (CheckCalendar)](#tool-calendar-checker-checkcalendar)
+- [Verifying the calendar works on your broker](#verifying-the-calendar-works-on-your-broker)
 - [Tool: StrategyQuant EA Patcher](#tool-strategyquant-ea-patcher)
 - [How Synchronization Works (Technical)](#how-synchronization-works-technical)
 - [Frequently Asked Questions](#frequently-asked-questions)
@@ -37,7 +37,6 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 |------|------|---------|
 | `HCPropsController.mq5` | Expert Advisor | The core EA: Master/Slave copy trading + prop-firm risk guardian + news filter, all in one. |
 | `HCProps_*.mqh` (6 files) | EA modules | Source modules included by `HCPropsController.mq5` (util, guardian, news, master, slave, panel). Keep them in the same folder as the `.mq5` when compiling; the compiled `.ex5` is self-contained. |
-| `CheckCalendar.mq5` | Script | Verifies that MT5's native economic calendar works on your broker (required for the news filter). |
 | `Patch-SQX-GV-Disable.ps1` + `Run-Patcher.bat` | Windows tool | Patches EAs exported from StrategyQuant (SQX) so they obey HCPropsController's limits. |
 | `patch-gv-disable.py` | Cross-platform tool | Same patcher as above, for Linux / macOS / any system with Python 3. |
 
@@ -71,7 +70,7 @@ Go to the [**Releases**](https://github.com/ivanrdgc/HCPropsController/releases)
 2. Attach the EA to a chart on your **MASTER** account, choose your risk limits, and you're protected.
 3. (Optional) Attach the same EA in **SLAVE** mode on other accounts/terminals to copy trades.
 4. (Optional, for StrategyQuant users) Patch your SQX EAs so they pause when a limit is hit.
-5. (Optional) Turn on the news filter and verify your broker serves the calendar with `CheckCalendar`.
+5. (Optional) Turn on the news filter — the EA logs `NEWS: N news scheduled` and warns loudly if your broker doesn't serve the calendar.
 
 ---
 
@@ -319,7 +318,7 @@ One MASTER account broadcasts its open positions to any number of SLAVE accounts
 
 ## Feature: News Filter
 
-Available in both modes. The EA can pause or close trading around economic news using MetaTrader 5's **native economic calendar** — no email, API, or WebRequest required. It reads the calendar that MetaQuotes already delivers to the terminal. (On a Slave, verify the Slave broker serves the calendar too — see `CheckCalendar`.)
+Available in both modes. The EA can pause or close trading around economic news using MetaTrader 5's **native economic calendar** — no email, API, or WebRequest required. It reads the calendar that MetaQuotes already delivers to the terminal. (On a Slave, the Slave broker must serve the calendar too — the EA warns in the log and panel if it doesn't.)
 
 ### Modes (`NewsMode`)
 
@@ -340,9 +339,9 @@ Available in both modes. The EA can pause or close trading around economic news 
 3. When the clock enters the window `[event − NewsDuration, event + NewsDuration]`, it applies the `NewsMode` action.
 4. On leaving the window, it re-enables trading automatically.
 
-The panel shows `NEWS ACTIVE: ...` in red during protection, and `News: watching (N)` the rest of the time.
+The panel shows `NEWS ACTIVE: <event> (ends in Xm)` in red during protection. The rest of the time it shows `News: watching (N)` (orange when `N` is 0 — the broker is probably not serving the calendar) plus the **next two events that will pause trading**, each as `> 14:30 USD CPI m/m (blocks in 1h05m)` — orange when the block starts within 30 minutes.
 
-> The news filter reads only MT5's **native** economic calendar — no network requests, no external feeds. Because calendar access from MQL5 is **per-broker**, verify it works on your broker with [CheckCalendar](#tool-calendar-checker-checkcalendar) before relying on it.
+> The news filter reads only MT5's **native** economic calendar — no network requests, no external feeds. Because calendar access from MQL5 is **per-broker**, check the log/panel after enabling it — see [Verifying the calendar works on your broker](#verifying-the-calendar-works-on-your-broker).
 
 ---
 
@@ -350,7 +349,7 @@ The panel shows `NEWS ACTIVE: ...` in red during protection, and `News: watching
 
 The EA draws an on-chart dashboard with everything important. It only redraws the labels that changed, to avoid flicker.
 
-**Both modes show** (when `PropFirmMode = true`): mode (guardian on / sync- or copy-only), the sync **file** in use, trading status (ENABLED/DISABLED), active locks, initial balance, day-start equity, live equity with daily/total %, configured daily/total limits with color bands, trades today / parallel / win & loss streaks vs. their caps, the trading-hours window, news status, the next daily reset, and the forced-close time.
+**Both modes show** (when `PropFirmMode = true`): mode (guardian on / sync- or copy-only), the sync **file** in use, trading status (ENABLED/DISABLED), active locks, initial balance, day-start equity, live equity with daily/total %, configured daily/total limits with color bands, trades today / parallel / win & loss streaks vs. their caps, the trading-hours window, news status with the **next two events that will pause trading** (and a countdown while a news block is active), the next daily reset, and the forced-close time.
 
 **SLAVE adds:** invert/multiplier/auto-lots/copy-mode summary and the connection status (CONNECTED / WAITING FOR MASTER).
 
@@ -386,17 +385,13 @@ On startup the EA restores these values. If a daily reset time was missed while 
 
 ---
 
-## Tool: Calendar Checker (CheckCalendar)
+## Verifying the calendar works on your broker
 
-The economic calendar is delivered by **MetaQuotes**, not your broker, but some brokers/builds restrict access to it from MQL5. Use `CheckCalendar.mq5` (a Script) to confirm the news filter will work before relying on it.
+The economic calendar is delivered by **MetaQuotes**, not your broker, but some brokers/builds restrict access to it from MQL5. The EA verifies it for you — no separate tool needed:
 
-### Verify in three steps
-
-1. **Interface:** In MT5, **View → Toolbox → Calendar**. If you see events listed, the terminal has calendar data.
-2. **Script:** Compile and run `CheckCalendar.mq5` (drag it onto a chart). It prints, in the *Experts* tab, how many high-impact events exist over the next days. If it prints `>>> OK ...`, the EA can read news on this broker.
-3. **EA log:** On start (with `NewsMode` other than `OPERATE`), the EA prints `NEWS: N news scheduled`. If this is always `0` on days with obvious news (NFP, CPI, FOMC), the broker is not serving the calendar.
-
-`CheckCalendar` inputs: `InpCurrencies` (currencies to check, empty = all), `InpDaysAhead` (days ahead to list), `InpMinImpact` (1=Low, 2=Moderate, 3=High).
+1. **EA log:** with `NewsMode` other than `OPERATE`, the EA prints `NEWS: N news scheduled` on start and hourly. If the calendar returns zero events it logs a loud `NEWS: WARNING ... ZERO events ... the news filter is effectively INACTIVE!` — if you see that on days with obvious news (NFP, CPI, FOMC), the broker is not serving the calendar.
+2. **Panel:** the dashboard shows `News: watching (N)` plus the next upcoming events that will pause trading; if `N` stays `0`, same conclusion.
+3. **Interface cross-check:** in MT5, **View → Toolbox → Calendar**. If events are listed there, the terminal has calendar data.
 
 **Requirement:** the terminal must be **connected** to a trading server (the calendar syncs from there). In the Strategy Tester the calendar may be limited on older builds.
 
@@ -524,7 +519,7 @@ A: Its heartbeat in `<syncfile>.slave.<login>` goes stale. With `ExpectedSlaves`
 A: The Slave's guardian acts on its own account exactly like on the Master (close positions for equity/streak breaches, block entries for count/hours breaches). With `PropagateSlaveClose = true` it also closes the originals on the Master (for closing breaches) and keeps the Master's trading disabled until the Slave's lock clears — so no account ever trades while another is locked.
 
 **Q: Does the news filter work without internet / a server?**
-A: It uses MT5's native calendar (no backend, login, or network requests). Confirm your broker serves it with `CheckCalendar.mq5`. If it doesn't, the news filter won't work on that terminal — leave `NewsMode = OPERATE` and the rest of the EA still works.
+A: It uses MT5's native calendar (no backend, login, or network requests). If your broker doesn't serve the calendar, the EA logs a loud `NEWS: WARNING ... ZERO events` and the panel shows `News: watching (0)` — in that case leave `NewsMode = OPERATE`; the rest of the EA still works.
 
 **Q: What does "0 = no limit" mean?**
 A: Setting `0` on any limit disables that limit entirely.
@@ -552,7 +547,7 @@ If you run into issues:
 1. Check the **Experts** and **Journal** tabs in MetaTrader 5 for messages.
 2. Verify all parameters are set correctly (especially the Master/Slave linking — both must use the same `FileName`).
 3. Make sure files are in the correct folders and the EAs are compiled.
-4. For news, run `CheckCalendar.mq5` to confirm the calendar is available.
+4. For news, check the Experts log for `NEWS: N news scheduled` (a `ZERO events` warning means the broker doesn't serve the calendar).
 
 ---
 

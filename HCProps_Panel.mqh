@@ -145,11 +145,43 @@ void UpdateDashboard()
      { ObjectDelete(0, "HCProps_Slaves"); LastDashboardValues[23] = ""; }
 
    if(IsNewsBlocked)
-     { CreateOrUpdateLabel("HCProps_News", 20, y, "NEWS ACTIVE: " + g_activeNews, clrRed, 10, true, 5); y += lh; }
+     {
+      string ends = (g_activeNewsEnd > TimeCurrent())
+                    ? " (ends in " + FmtIn(g_activeNewsEnd - TimeCurrent()) + ")" : "";
+      CreateOrUpdateLabel("HCProps_News", 20, y, "NEWS ACTIVE: " + g_activeNews + ends, clrRed, 10, true, 5); y += lh;
+     }
    else if(NewsMode != NEWS_OPERATE)
-     { CreateOrUpdateLabel("HCProps_News", 20, y, "News: watching (" + IntegerToString(ArraySize(g_newsTimes)) + ")", clrLime, 9, false, 5); y += lh; }
+     {
+      color wc = (ArraySize(g_newsTimes) == 0) ? clrOrange : clrLime; // 0 = broker likely serves no calendar
+      CreateOrUpdateLabel("HCProps_News", 20, y, "News: watching (" + IntegerToString(ArraySize(g_newsTimes)) + ")", wc, 9, false, 5); y += lh;
+     }
    else
      { ObjectDelete(0, "HCProps_News"); LastDashboardValues[5] = ""; } // OPERATE: no news line (don't stack an empty label on "Locks:")
+
+   // Upcoming events that will pause trading (next 2), shown whenever the filter is on
+   int nidx[];
+   int ncnt = (NewsMode != NEWS_OPERATE) ? NextNewsEvents(nidx, 2) : 0;
+   for(int k = 0; k < 2; k++)
+     {
+      string lname = "HCProps_NewsNext" + IntegerToString(k);
+      int    lidx  = 24 + k;
+      if(k < ncnt)
+        {
+         int      i     = nidx[k];
+         datetime ev    = g_newsTimes[i];
+         datetime start = ev - NewsDuration;
+         string   nm    = g_newsName[i];
+         if(StringLen(nm) > 30)
+            nm = StringSubstr(nm, 0, 28) + "..";
+         bool   soon = (start - TimeCurrent() <= 1800);
+         string when = TimeToString(ev, (ev - TimeCurrent() > 86400) ? TIME_DATE | TIME_MINUTES : TIME_MINUTES);
+         CreateOrUpdateLabel(lname, 30, y, "> " + when + " " + g_newsCurr[i] + " " + nm +
+                             " (blocks in " + FmtIn(start - TimeCurrent()) + ")",
+                             soon ? clrOrange : clrSilver, 9, false, lidx); y += lh - 2;
+        }
+      else
+        { ObjectDelete(0, lname); LastDashboardValues[lidx] = ""; }
+     }
 
    if(PropFirmMode)
      {

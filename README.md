@@ -36,6 +36,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 | File | Type | Purpose |
 |------|------|---------|
 | `HCPropsController.mq5` | Expert Advisor | The core EA: Master/Slave copy trading + prop-firm risk guardian + news filter, all in one. |
+| `HCProps_*.mqh` (6 files) | EA modules | Source modules included by `HCPropsController.mq5` (util, guardian, news, master, slave, panel). Keep them in the same folder as the `.mq5` when compiling; the compiled `.ex5` is self-contained. |
 | `CheckCalendar.mq5` | Script | Verifies that MT5's native economic calendar works on your broker (required for the news filter). |
 | `Patch-SQX-GV-Disable.ps1` + `Run-Patcher.bat` | Windows tool | Patches EAs exported from StrategyQuant (SQX) so they obey HCPropsController's limits. |
 | `patch-gv-disable.py` | Cross-platform tool | Same patcher as above, for Linux / macOS / any system with Python 3. |
@@ -46,7 +47,8 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 
 ## Features at a Glance
 
-- **Prop-firm risk guardian (Master AND Slave)** — daily and total profit/loss limits, max parallel trades, max trades per day, consecutive win/loss streak limits, trading-hours window, and a forced close time, enforced independently on every account. When a limit is hit it closes positions, deletes pending orders, and disables trading. With `PropagateSlaveClose`, a Slave breach also closes the originals on the Master and **locks the Master**: new orders are only accepted while *every* account has trading enabled.
+- **Prop-firm risk guardian (Master AND Slave)** — daily and total profit/loss limits (checked every 200 ms), max parallel trades, max trades per day, consecutive win/loss streak limits, trading-hours window, and a forced close time, enforced independently on every account. When a limit is hit it closes positions, deletes pending orders, and disables trading. With `PropagateSlaveClose`, a Slave breach also closes the originals on the Master and **locks the Master**: new orders are only accepted while *every* account has trading enabled.
+- **Dead-Slave detection** — every Slave publishes a heartbeat; with `ExpectedSlaves` set, the Master blocks new entries the moment a Slave terminal goes silent, so nothing trades unhedged. A per-account **trade log** (`TradePairLog`) records every closed position for hedge-leakage reconciliation.
 - **Copy trading** — replicate one MASTER account onto any number of SLAVE accounts on the same machine, with auto lot scaling by point value, lot multiplier, symbol mapping, inverse mode, distance-based SL/TP (measured from each account's own fill price), and Slave→Master close propagation (a Slave-side SL/TP/manual close flattens the Master and every other Slave within ~half a second).
 - **News filter** — pause or close trading around economic news using MT5's native economic calendar (fully offline).
 - **Live information panel** — an on-chart dashboard showing status, limits, counters, schedules, and connection state.
@@ -65,7 +67,7 @@ Go to the [**Releases**](https://github.com/ivanrdgc/HCPropsController/releases)
 
 ## Quick Start
 
-1. Copy `HCPropsController.mq5` into your MT5 `MQL5/Experts/` folder and compile it (or use the provided `.ex5`).
+1. Copy `HCPropsController.mq5` **and the `HCProps_*.mqh` modules** into your MT5 `MQL5/Experts/` folder and compile (or just use the provided `.ex5`, which is self-contained).
 2. Attach the EA to a chart on your **MASTER** account, choose your risk limits, and you're protected.
 3. (Optional) Attach the same EA in **SLAVE** mode on other accounts/terminals to copy trades.
 4. (Optional, for StrategyQuant users) Patch your SQX EAs so they pause when a limit is hit.
@@ -77,7 +79,7 @@ Go to the [**Releases**](https://github.com/ivanrdgc/HCPropsController/releases)
 
 ### Installation
 
-1. Copy `HCPropsController.mq5` into the `MQL5/Experts/` folder of your MetaTrader 5.
+1. Copy `HCPropsController.mq5` and the `HCProps_*.mqh` modules into the `MQL5/Experts/` folder of your MetaTrader 5 (same folder; or deploy only the compiled `.ex5`).
 2. Restart MetaTrader 5 or refresh the Navigator (F5), then compile the EA in MetaEditor (F7).
 3. Drag the EA onto a chart.
 4. In **Tools → Options → Expert Advisors**, allow algorithmic trading. (No `WebRequest` whitelist is needed — the EA never makes network requests.)
@@ -105,7 +107,7 @@ With `PropagateSlaveClose = true` the whole system behaves as one unit: a Slave-
 | Operation mode | `Mode` | `Master (executes trades)` | Select MASTER for this account. |
 | Enable limits guardian | `PropFirmMode` | `true` | `true` = enforce all risk limits on this account (works in **both** modes since v2.20). `false` = pure relay/copy, no intervention in your trading. |
 | Force initial balance | `ForceInitialBalance` | `0` | `0` = auto-detect the initial balance from deposits. `>0` = use this fixed value as the initial balance (basis for total/% limits). |
-| Reset counters and locks on init | `ResetCountersOnInit` | `false` | `true` + reinitialize the EA = resets counters, daily initial equity, and **clears the sticky total lock**. Use it when starting a fresh account/challenge. |
+| Reset counters and locks on init | `ResetCountersOnInit` | `false` | `true` + reinitialize the EA = resets counters, daily initial equity, and **clears the sticky daily and total locks** (both the persisted and the in-memory state). Use it when starting a fresh account/challenge, or to manually lift a latched lock. Remember to set it back to `false` afterwards. A lock re-latches immediately if its limit is still enabled and the equity still breaches it. |
 
 #### === SYNC FILE ===
 
@@ -113,7 +115,20 @@ With `PropagateSlaveClose = true` the whole system behaves as one unit: a Slave-
 |-----------|----------|---------|-------------|
 | File name | `FileName` | `master_00001.csv` | Shared file name that links a Master to its Slave(s). The Slave must use the **same** value. For a second independent setup, bump the number (`master_00002.csv`, …) on both sides. |
 | Custom path | `CustomFilePath` | `""` | Custom path inside `Common\Files` (optional). |
-| Symbols | `Symbols` | `""` | (MASTER) Comma-separated symbols to replicate (empty = all). E.g. `EURUSD,US30`. |
+| Symbols | `Symbols` | `""` | (MASTER) Comma-separated symbols to replicate (empty = all). E.g. `EURUSD,US30`. **Warning:** an excluded symbol's positions are NOT hedged — the Master logs a warning per excluded position. |
+
+#### === MULTI-ACCOUNT SAFETY (MASTER only) ===
+
+| Parameter | Variable | Default | Description |
+|-----------|----------|---------|-------------|
+| Fresh Slave heartbeats required | `ExpectedSlaves` | `0` | **Set this to your number of Slaves.** The Master blocks new entries while fewer than this many Slaves have a fresh heartbeat — the only protection against a silently crashed Slave terminal leaving new trades unhedged. `0` = off. |
+| Heartbeat timeout (seconds) | `SlaveHeartbeatTimeoutSec` | `15` | A Slave heartbeat older than this is considered stale. |
+
+#### === LOGGING ===
+
+| Parameter | Variable | Default | Description |
+|-----------|----------|---------|-------------|
+| Trade pair log | `TradePairLog` | `true` | Each account appends every closed position to `<syncfile>.trades.<login>.csv`. Join Master + Slave files on `masterTicket` to measure hedge leakage per pair. |
 
 #### === EQUITY LIMITS (Master and Slave) ===
 
@@ -237,7 +252,9 @@ Slave close closes Master = true
 
 ## Feature: Prop-Firm Guardian
 
-Active in **both modes** when `PropFirmMode = true` (each account enforces its own configured limits). The guardian continuously monitors the account and enforces every configured limit.
+Active in **both modes** when `PropFirmMode = true` (each account enforces its own configured limits). The guardian continuously monitors the account and enforces every configured limit. **Equity limits (daily/total) are checked every 200 ms** so a fast spike cannot run a full second past a limit; count/streak limits update on every trade event; hours/news on a 1 s cadence. "Trades per day" counts **distinct positions** (partial fills are one trade; on a Slave, a re-replicated Master ticket is still one trade).
+
+Remember the EA reacts *after* a threshold is touched and market-closes with slippage — always configure the limits with a safety buffer inside the firm's hard rules (e.g. 4.6% for a 5% rule).
 
 On a **Slave**, two extra things happen when `PropagateSlaveClose = true`:
 
@@ -285,8 +302,8 @@ Using the smaller basis prevents the daily allowance from drifting larger than y
 
 One MASTER account broadcasts its open positions to any number of SLAVE accounts running on the **same machine/VPS** (communication is via a shared file — see [How Synchronization Works](#how-synchronization-works-technical)).
 
-- **Per-ticket mapping.** Each Master position is mapped to a Slave position via the order comment `HC<masterTicket>` plus the Slave's `MagicNumber`. The Slave only ever manages positions carrying its own magic.
-- **Lot sizing.** `SlaveLot = NormalizeVolume(MasterLot × pointValueRatio × RiskMultiplier)`, clamped to the symbol's min/max/step. With `AutoLotScaling = true` the point-value ratio (Master $/point ÷ Slave $/point, from the value the Master writes per line) equalizes money-per-point across brokers with different contract sizes; `RiskMultiplier` is a pure preference on top. If the broker's min/max lots clamp the result, the Slave logs a **hedge coverage reduced** warning. It is **not** proportional to balance.
+- **Per-ticket mapping.** Each Master position is mapped to a Slave position via the order comment `HC<masterTicket>` plus the Slave's `MagicNumber`, with a GlobalVariable backup per position (`HCProps_Map_<slaveTicket>`) so the mapping survives brokers that strip/overwrite comments and EA restarts. The Slave only ever manages positions carrying its own magic.
+- **Lot sizing.** `SlaveLot = NormalizeVolume(MasterLot × pointValueRatio × RiskMultiplier)`, clamped to the symbol's min/max/step. With `AutoLotScaling = true` the point-value ratio (Master $/point ÷ Slave $/point, from the value the Master writes per line) equalizes money-per-point across brokers with different contract sizes; `RiskMultiplier` is a pure preference on top. Broker clamps are warned in **both** directions: down = "hedge coverage reduced", up to the minimum lot = "OVERSIZED hedge". `AutoLotScaling` assumes both accounts share the same **account currency** (the Master writes its currency into the file; the Slave warns loudly on mismatch). It is **not** proportional to balance.
 - **Slave-close propagation.** With `PropagateSlaveClose = true` (default), a mirrored position that closes on the Slave by its own SL/TP, a manual close, a stop out, or the Slave profit lock is propagated back: the Slave writes a close request file, the Master closes the original ticket (checked every 200 ms), the sync file updates, and every other Slave flattens. Sync-driven closes (the Master closed first) are never propagated back, so there are no loops. While a request is pending the Slave will not reopen that ticket; if the Master doesn't process it within 120 s (offline, or propagation disabled there) the Slave resumes plain mirroring.
 - **Distance-based SL/TP.** The Slave doesn't copy the Master's absolute SL/TP prices — it copies the **distance** from the Master's entry and applies it to its **own actual fill price**. So if the Master enters at 1.04500 with a stop 0.01000 away (1.05500) and the Slave fills at 1.04700 (slippage / different quotes), the Slave's stop is set at 1.05700 — the same distance, preserving the intended risk. `CopyMode = NORMAL` keeps re-applying this when the Master moves its SL/TP; `INCOGNITO` sets it only at open.
 - **Inverse trading.** `InverseMode = true` (the default) flips BUY↔SELL and **mirrors** SL/TP around the entry — the Master's TP distance becomes the Slave's SL, and vice versa.
@@ -294,7 +311,7 @@ One MASTER account broadcasts its open positions to any number of SLAVE accounts
 - **Volume reduction tracking.** If the Master partially closes a position, the Slave reduces its volume to match (reduction only).
 - **Per-Slave guardian.** The Slave runs the full prop-firm guardian on its own account (see [Prop-Firm Guardian](#feature-prop-firm-guardian)); breaches close the Master's originals and lock the Master via `PropagateSlaveClose`.
 
-> **Account type:** designed for **hedging** accounts (and the common case of one position per symbol per account).
+> **Account type:** requires **hedging** accounts — SLAVE mode refuses to initialize on a netting account (per-ticket mapping would break); MASTER mode warns. The common case is one position per symbol per account.
 >
 > **News interaction:** the news filter can run on any account. On the Master, pauses/closes replicate to the Slaves automatically. On a Slave (with `PropagateSlaveClose`), a news lock disables the Master too, and `CLOSE_ALL` closes the originals everywhere.
 
@@ -337,7 +354,7 @@ The EA draws an on-chart dashboard with everything important. It only redraws th
 
 **SLAVE adds:** invert/multiplier/auto-lots/copy-mode summary and the connection status (CONNECTED / WAITING FOR MASTER).
 
-**MASTER adds:** a red `SLAVE LOCK: <login> (<reason>)` line whenever a Slave's lock is currently disabling the Master.
+**MASTER adds:** a red `SLAVE LOCK: <login> (<reason>)` line whenever a Slave's lock is currently disabling the Master, and a `Slaves alive: N / M required` line (green when all expected heartbeats are present, red + `(BLOCKING)` when a Slave is down).
 
 **Color coding (graded by how close you are to a limit):**
 
@@ -462,13 +479,24 @@ The exit code is `1` if any file errored, `0` otherwise.
   - reduces volume to match a Master partial close,
   - sets/updates SL/TP as a distance from the Master's entry applied to the Slave's own fill price (re-applied each tick in `NORMAL` mode; in `INCOGNITO` set at open and re-tried only while the position has no levels at all),
   - opens any Master position it does not have yet (tagged with `HC<masterTicket>`; failed opens retry every ~1.5 s).
-- **Close requests (Slave → Master):** with `PropagateSlaveClose = true`, Slave-initiated closes are written to `<syncfile>.close.<slaveLogin>` as `masterTicket,reason` lines. The Master polls `<syncfile>.close.*` every 200 ms, closes the requested tickets, deletes the request files, and rewrites the sync file so the remaining Slaves follow.
-- **Lock files (Slave → Master):** while a Slave's guardian has trading disabled, it maintains `<syncfile>.lock.<slaveLogin>` (content = the active lock flags). The Master checks `<syncfile>.lock.*` every second: any file present → Master trading disabled (new entries blocked, pendings deleted) until all lock files are gone. The file is deleted when the Slave's lock clears, or when the Slave EA is deliberately removed from its chart; if a Slave terminal *crashes* while locked, the Master stays safely locked until the Slave comes back (or you delete the file manually).
-- **Disconnect detection:** the Master deletes its sync file on shutdown; the Slave then shows `WAITING FOR MASTER`. Close requests queued while the Master is offline stay on disk and are processed when it returns.
+- **Slave status files (Slave → Master):** each Slave maintains `<syncfile>.slave.<login>`, rewritten every second (and immediately on changes):
+  ```
+  HB,<timestamp>                  ← heartbeat (machine-local clock, shared by both terminals)
+  LOCK,<0|1>,<active lock flags>  ← this Slave's guardian state
+  CLOSE,<masterTicket>,<reason>   ← 0..n pending close requests
+  END,<timestamp>                 ← torn-read marker
+  ```
+  The Master reads all `<syncfile>.slave.*` every 200 ms and: executes the CLOSE requests (idempotent and **retried** — a request line stays in the file until the ticket disappears from the sync file, which is the natural ack, so a temporarily failed close is retried instead of lost); treats any `LOCK,1` as "block new entries"; and counts fresh heartbeats. Torn reads keep the previous cached state for that Slave.
+- **Dead-Slave detection (`ExpectedSlaves`):** set `ExpectedSlaves` on the Master to the number of Slaves that must be alive. If fewer than that many status files have a heartbeat younger than `SlaveHeartbeatTimeoutSec`, the Master **blocks new entries** (`SlaveDown` lock, red `Slaves alive` line on the panel) — a crashed/hung Slave terminal can no longer leave new Master trades unhedged. Removing a Slave EA from its chart deletes its status file; with `ExpectedSlaves` still counting it, the Master stays blocked until you adjust the input (intended: removing a hedge leg should be a deliberate, two-step act).
+- **Trade log:** with `TradePairLog = true` every account appends one line per closed position to `<syncfile>.trades.<login>.csv` (time, M/S, masterTicket, position, symbol, side, volume, close price, profit, swap, commission, close reason). Join the Master's and a Slave's file on `masterTicket` to measure the per-pair hedge leakage directly.
+- **Disconnect detection:** the Master deletes its sync file on shutdown; the Slave then shows `WAITING FOR MASTER`. Close requests persist in the Slave status files while the Master is offline and are processed when it returns.
+- **Duplicate-Master protection:** a per-`FileName` chart mutex refuses a second Master in the same terminal, and a foreign `SEQ` in the sync file (another terminal writing it) is detected and logged loudly.
 
 > **Upgrading from v2.00:** the file format changed — update the EA on the **Master and every Slave at the same time** (an old Slave cannot parse a v2 file and vice versa). If you had set `RiskMultiplier` to compensate for a contract-size difference (e.g. `0.5` because the Slave's index contract is worth twice as much per point), set it **back to `1.0`**: `AutoLotScaling` now handles that per symbol, and a leftover manual multiplier would halve every other symbol's hedge.
 >
 > **Upgrading to v2.20:** the guardian inputs (equity/trading limits, hours, forced close, news) are now **active on Slaves** and load with their defaults the first time the new build attaches. Review every Slave's inputs after updating: either configure that account's actual prop-firm rules, or set `PropFirmMode = false` on the Slave to keep the old copy-only behavior. `SlaveTotalProfitLimitPercent` was removed — use `TotalProfitLimitPercent` instead.
+>
+> **Upgrading to v2.30:** the v2.20 `.close.<login>` / `.lock.<login>` side files are replaced by the `.slave.<login>` status file (leftovers are cleaned automatically on init). SLAVE mode now **requires a hedging account** (init fails on netting). Recommended: set `ExpectedSlaves` on the Master to your actual number of Slaves — it is the only protection against a silently dead Slave terminal.
 
 ---
 
@@ -489,6 +517,9 @@ A: With `AutoLotScaling = true` it copies the volume that gives the **same money
 **Q: What happens when the Slave's own SL/TP is hit before the Master's?**
 A: With `PropagateSlaveClose = true` (default), the Slave asks the Master to close the original position immediately (the Master polls every 200 ms), and every other Slave flattens as soon as the sync file updates. With `false`, the Slave keeps mirroring the file and would reopen the position on the next change.
 
+**Q: What happens if a Slave terminal crashes or hangs?**
+A: Its heartbeat in `<syncfile>.slave.<login>` goes stale. With `ExpectedSlaves` set on the Master, the Master blocks new entries within ~`SlaveHeartbeatTimeoutSec` seconds and shows a red `Slaves alive` line — no new trade can be opened unhedged. Existing positions are still protected by the broker-side SL/TP that both legs always carry. When the Slave comes back, its heartbeat resumes and the Master unblocks automatically.
+
 **Q: What happens when a Slave hits one of its own limits?**
 A: The Slave's guardian acts on its own account exactly like on the Master (close positions for equity/streak breaches, block entries for count/hours breaches). With `PropagateSlaveClose = true` it also closes the originals on the Master (for closing breaches) and keeps the Master's trading disabled until the Slave's lock clears — so no account ever trades while another is locked.
 
@@ -508,7 +539,7 @@ A: Purely by `FileName` — set the Slave's `FileName` to the same value as its 
 - Works with **MetaTrader 5** only.
 - The Windows patcher requires PowerShell; on Linux/macOS use the Python patcher.
 - Risk limits are computed from the account's detected initial balance (or `ForceInitialBalance`).
-- The EA's internal timer runs every 200 ms (sync, close requests); guardian checks and the panel update every second.
+- The EA's internal timer runs every 200 ms (sync, close requests, equity limits, heartbeats); count/hours/news checks and the panel update every second.
 - Copy trading requires the Master and Slave terminals to share the same `Common\Files` (i.e. run on the same machine/VPS).
 - After editing any `.mq5`, recompile it in MetaEditor (F7).
 

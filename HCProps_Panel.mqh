@@ -107,10 +107,16 @@ void UpdateDashboard()
    string modeText;
    if(Mode == MODE_MASTER)
       modeText = PropFirmMode ? "MASTER (guardian ON)" : "MASTER (sync only)";
-   else
+   else if(Mode == MODE_SLAVE)
       modeText = PropFirmMode ? "SLAVE (guardian ON)" : "SLAVE (copy only)";
-   CreateOrUpdateLabel("HCProps_Mode", 20, y, "Mode: " + modeText, clrYellow, 11, true, 1); y += lh + 3;
-   CreateOrUpdateLabel("HCProps_File", 20, y, "File: " + SyncFileLabel(), clrAqua, 10, false, 2); y += lh + 5;
+   else
+      modeText = PropFirmMode ? "GUARDIAN ONLY (no copy)" : "NONE (guardian OFF - idle!)";
+   CreateOrUpdateLabel("HCProps_Mode", 20, y, "Mode: " + modeText,
+                       (Mode == MODE_NONE && !PropFirmMode) ? clrRed : clrYellow, 11, true, 1); y += lh + 3;
+   if(Mode != MODE_NONE)
+     { CreateOrUpdateLabel("HCProps_File", 20, y, "File: " + SyncFileLabel(), clrAqua, 10, false, 2); y += lh + 5; }
+   else
+     { ObjectDelete(0, "HCProps_File"); LastDashboardValues[2] = ""; }
 
    if(Mode == MODE_SLAVE)
      {

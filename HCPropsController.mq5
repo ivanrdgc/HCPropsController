@@ -4,11 +4,11 @@
 //|  Single EA, file-based sync on the same VPS. No backend/license. |
 //+------------------------------------------------------------------+
 #property strict
-#property version "2.31"
+#property version "2.40"
 #property description "HCPropsController: Master/Slave copy trading, prop-firm limits and news filter in a single EA."
-#property description "v2.30: Slave heartbeats (dead-Slave detection via ExpectedSlaves), unified Slave status file,"
-#property description "200 ms equity checks, two-Master guard, hedging-account validation, comment-loss-proof"
-#property description "ticket mapping, account-currency validation, and a per-account trade log for hedge reconciliation."
+#property description "v2.40: NONE mode (risk management on a single account, no replication files) and"
+#property description "HistoryFromDate for prop-firm account resets (ignore history before a chosen moment;"
+#property description "initial balance becomes the balance as of that time)."
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -22,8 +22,9 @@
 //===================================================================
 enum HCMode
   {
-   MODE_MASTER = 0, // Master (executes trades)
-   MODE_SLAVE  = 1  // Slave (replicates trades)
+   MODE_MASTER = 0, // Master (executes trades and replicates to Slaves)
+   MODE_SLAVE  = 1, // Slave (replicates trades from a Master)
+   MODE_NONE   = 2  // None (risk management only; no replication, no shared files)
   };
 
 enum HCCopyMode
@@ -51,10 +52,11 @@ enum HCNewsImpact
 // INPUT PARAMETERS
 //===================================================================
 input group "=== GENERAL SETTINGS ==="
-input HCMode Mode                 = MODE_MASTER; // Operation mode
-input bool   PropFirmMode         = true;        // Enable limits guardian (Master and Slave)
-input double ForceInitialBalance  = 0.0;         // Force initial balance (0 = auto-detect)
-input bool   ResetCountersOnInit  = false;       // Reset counters and locks on init
+input HCMode   Mode                = MODE_MASTER; // Operation mode
+input bool     PropFirmMode        = true;        // Enable limits guardian (all modes)
+input double   ForceInitialBalance = 0.0;         // Force initial balance (0 = auto-detect)
+input datetime HistoryFromDate     = 0;           // Ignore history before this time (account reset); 0 = full history
+input bool     ResetCountersOnInit = false;       // Reset counters and locks on init
 
 input group "=== SYNC FILE ==="
 input string FileName             = "master_00001.csv"; // Shared file name (Master and Slave must match; bump 00001 for more)
@@ -137,6 +139,8 @@ string GV_NEXT_RESET  = "HCPropsController_NextReset";
 void DisableTrading()    { GlobalVariableSet(GV_DISABLE, 1.0); }
 void EnableTrading()     { GlobalVariableDel(GV_DISABLE); }
 bool TradingIsDisabled() { return(GlobalVariableCheck(GV_DISABLE) && GlobalVariableGet(GV_DISABLE) == 1.0); }
+
+string ModeName() { return (Mode == MODE_MASTER ? "MASTER" : (Mode == MODE_SLAVE ? "SLAVE" : "NONE")); }
 
 //===================================================================
 // RUNTIME STATE
@@ -221,7 +225,7 @@ datetime g_activeNewsEnd  = 0; // end of the currently active protection window
 //===================================================================
 int OnInit()
   {
-   Print("HCPropsController v2 initialized. Mode: ", (Mode == MODE_MASTER ? "MASTER" : "SLAVE"));
+   Print("HCPropsController v2 initialized. Mode: ", ModeName());
 
    // Time-range validations (the guardian runs in BOTH modes)
    if(DailyResetHour < 0 || DailyResetHour > 23 || DailyResetMinute < 0 || DailyResetMinute > 59)
@@ -239,6 +243,14 @@ int OnInit()
      { Print("ERROR: ExpectedSlaves must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
    if(ExpectedSlaves > 0 && SlaveHeartbeatTimeoutSec < 5)
      { Print("ERROR: SlaveHeartbeatTimeoutSec must be >= 5"); return INIT_PARAMETERS_INCORRECT; }
+   if(HistoryFromDate > 0)
+     {
+      if(HistoryFromDate > TimeCurrent())
+        { Print("ERROR: HistoryFromDate is in the future"); return INIT_PARAMETERS_INCORRECT; }
+      Print("HistoryFromDate active: ignoring account history before ",
+            TimeToString(HistoryFromDate, TIME_DATE | TIME_SECONDS),
+            " (initial balance = balance as of that moment)");
+     }
 
    // SLAVE validation: needs a shared file name to read from
    if(Mode == MODE_SLAVE)
@@ -274,7 +286,8 @@ int OnInit()
       GlobalVariableSet(MasterMutexGVName(), (double)ChartID());
      }
 
-   CleanupLegacySideFiles(); // v2.20 .close.*/.lock.* files are replaced by .slave.<login>
+   if(Mode != MODE_NONE)
+      CleanupLegacySideFiles(); // v2.20 .close.*/.lock.* files are replaced by .slave.<login>
 
    CalculateAccountDepositsAndWithdrawals();
 
@@ -340,7 +353,7 @@ int OnInit()
       CheckGuardRules();
    CheckNews();
 
-   Print((Mode == MODE_MASTER ? "MASTER" : "SLAVE"), " OnInit: PropFirmMode=", PropFirmMode,
+   Print(ModeName(), " OnInit: PropFirmMode=", PropFirmMode,
          " TradesToday=", TradesOpenedToday, "/", MaxTradesPerDay);
 
    // 200 ms timer: fast Slave reaction / close-request processing.
@@ -361,7 +374,7 @@ int OnInit()
       Print("OnInit: syncing initial positions. Positions: ", PositionsTotal());
       SyncPositionsToFile();
      }
-   else
+   else if(Mode == MODE_SLAVE)
      {
       string rel = GetSyncFilePath();
       MasterFileExists = FileIsExist(rel, FILE_COMMON);
@@ -375,6 +388,7 @@ int OnInit()
         }
       WriteSlaveStatusFile(); // publish heartbeat + lock state right away
      }
+   // MODE_NONE: guardian only - no shared files of any kind
 
    return INIT_SUCCEEDED;
   }
@@ -390,7 +404,7 @@ void OnTimer()
    // ---- every 200 ms: the fast paths ----
    if(Mode == MODE_MASTER)
       ProcessSlaveStatusFiles();  // close requests + lock flags + heartbeats
-   else
+   else if(Mode == MODE_SLAVE)
      {
       SlaveSync();                // replicate / reconcile
       if(g_statusDirty)
@@ -432,7 +446,7 @@ void OnTimer()
 
    if(Mode == MODE_MASTER)
       SyncPositionsToFile();
-   else
+   else if(Mode == MODE_SLAVE)
       WriteSlaveStatusFile(); // heartbeat (and lock/close lines) refresh
 
    // Housekeeping: keep the per-ticket throttle/warn arrays bounded.
@@ -441,7 +455,7 @@ void OnTimer()
    PruneThrottle(g_ackLogTicket, g_ackLogWhenMs, 600000);
    if(Mode == MODE_SLAVE)
       PruneMapGVs();
-   else
+   else if(Mode == MODE_MASTER)
       PruneWarnedExcluded();
 
    UpdateDashboard();
@@ -481,12 +495,12 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       if(PropFirmMode)
          CheckGuardRules();
 
-      if(ok)
-         LogClosedDeal(trans.deal); // hedge-reconciliation trade log (both modes)
+      if(ok && Mode != MODE_NONE)
+         LogClosedDeal(trans.deal); // hedge-reconciliation trade log (no shared files in NONE)
 
       if(Mode == MODE_MASTER)
          SyncPositionsToFile();
-      else if(ok)
+      else if(Mode == MODE_SLAVE && ok)
          SlavePropagateCloseFromDeal(trans.deal);
      }
 
@@ -557,7 +571,7 @@ void OnDeinit(const int reason)
             GlobalVariableDel(MasterMutexGVName());
         }
      }
-   else // SLAVE
+   else if(Mode == MODE_SLAVE)
      {
       // Removed for good: take this Slave out of the system (its status file is
       // the Master's heartbeat/lock source). On a mere recompile/restart the file
@@ -571,6 +585,11 @@ void OnDeinit(const int reason)
             FileDelete(st, FILE_COMMON);
          EnableTrading();
         }
+     }
+   else // NONE: nothing on disk to clean up; just release the lock signal on removal
+     {
+      if(reason == REASON_REMOVE || reason == REASON_CHARTCLOSE)
+         EnableTrading();
      }
   }
 //+------------------------------------------------------------------+

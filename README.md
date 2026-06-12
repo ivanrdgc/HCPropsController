@@ -14,7 +14,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 - [Quick Start](#quick-start)
 - [The HCPropsController EA](#the-hcpropscontroller-ea)
   - [Installation](#installation)
-  - [The Two Operating Modes](#the-two-operating-modes)
+  - [The Operating Modes](#the-operating-modes)
   - [MASTER Mode Parameters](#master-mode-parameters)
   - [SLAVE Mode Parameters](#slave-mode-parameters)
 - [Feature: Prop-Firm Guardian](#feature-prop-firm-guardian)
@@ -46,7 +46,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 
 ## Features at a Glance
 
-- **Prop-firm risk guardian (Master AND Slave)** — daily and total profit/loss limits (checked every 200 ms), max parallel trades, max trades per day, consecutive win/loss streak limits, trading-hours window, and a forced close time, enforced independently on every account. When a limit is hit it closes positions, deletes pending orders, and disables trading. With `PropagateSlaveClose`, a Slave breach also closes the originals on the Master and **locks the Master**: new orders are only accepted while *every* account has trading enabled.
+- **Prop-firm risk guardian (every mode)** — daily and total profit/loss limits (checked every 200 ms), max parallel trades, max trades per day, consecutive win/loss streak limits, trading-hours window, and a forced close time, enforced independently on every account — including standalone accounts via `Mode = NONE` (guardian only, no shared files). When a limit is hit it closes positions, deletes pending orders, and disables trading. With `PropagateSlaveClose`, a Slave breach also closes the originals on the Master and **locks the Master**: new orders are only accepted while *every* account has trading enabled. Survived a prop-firm **account reset**? `HistoryFromDate` makes the EA ignore all older history and re-baseline from the reset moment.
 - **Dead-Slave detection** — every Slave publishes a heartbeat; with `ExpectedSlaves` set, the Master blocks new entries the moment a Slave terminal goes silent, so nothing trades unhedged. A per-account **trade log** (`TradePairLog`) records every closed position for hedge-leakage reconciliation.
 - **Copy trading** — replicate one MASTER account onto any number of SLAVE accounts on the same machine, with auto lot scaling by point value, lot multiplier, symbol mapping, inverse mode, distance-based SL/TP (measured from each account's own fill price), and Slave→Master close propagation (a Slave-side SL/TP/manual close flattens the Master and every other Slave within ~half a second).
 - **News filter** — pause or close trading around economic news using MT5's native economic calendar (fully offline).
@@ -83,7 +83,7 @@ Go to the [**Releases**](https://github.com/ivanrdgc/HCPropsController/releases)
 3. Drag the EA onto a chart.
 4. In **Tools → Options → Expert Advisors**, allow algorithmic trading. (No `WebRequest` whitelist is needed — the EA never makes network requests.)
 
-### The Two Operating Modes
+### The Operating Modes
 
 #### 🔴 MASTER mode (primary account)
 
@@ -95,6 +95,10 @@ Meant to run **alone** on its account: HCPropsController itself replicates the M
 
 With `PropagateSlaveClose = true` the whole system behaves as one unit: a Slave-side close (SL/TP/manual/breach) closes the original on the Master and every other Slave, and a Slave whose trading is disabled (any lock) disables trading on the Master too — **new orders are only accepted while every account has trading enabled**.
 
+#### ⚪ NONE mode (single account, risk management only)
+
+Runs the full guardian and the news filter on one account **without any copy trading**: no shared files are created in `Common\Files` at all (no sync file, no status file, no trade log). Use it when you only want HCPropsController to restrict trading and close trades on a standalone account — for example a prop account you trade with one EA and no hedge. Everything in [Prop-Firm Guardian](#feature-prop-firm-guardian) applies; the copy-trading and propagation parameters are ignored.
+
 ---
 
 ### MASTER Mode Parameters
@@ -103,9 +107,10 @@ With `PropagateSlaveClose = true` the whole system behaves as one unit: a Slave-
 
 | Parameter | Variable | Default | Description |
 |-----------|----------|---------|-------------|
-| Operation mode | `Mode` | `Master (executes trades)` | Select MASTER for this account. |
-| Enable limits guardian | `PropFirmMode` | `true` | `true` = enforce all risk limits on this account (works in **both** modes since v2.20). `false` = pure relay/copy, no intervention in your trading. |
+| Operation mode | `Mode` | `Master (executes trades)` | `MASTER` = guardian + replicate to Slaves; `SLAVE` = guardian + replicate from a Master; `NONE` = guardian only on this account, **no shared files / no replication**. |
+| Enable limits guardian | `PropFirmMode` | `true` | `true` = enforce all risk limits on this account (works in **every** mode since v2.20). `false` = pure relay/copy, no intervention in your trading. |
 | Force initial balance | `ForceInitialBalance` | `0` | `0` = auto-detect the initial balance from deposits. `>0` = use this fixed value as the initial balance (basis for total/% limits). |
+| Ignore history before | `HistoryFromDate` | `0` | For prop-firm **account resets** (balance restored, trade history kept): set it to a moment just **after** the reset and the EA ignores everything older — the initial balance becomes the **balance as of that time**, and the daily baseline and trade/streak counters only see newer deals. `0` = full history. |
 | Reset counters and locks on init | `ResetCountersOnInit` | `false` | `true` + reinitialize the EA = resets counters, daily initial equity, and **clears the sticky daily and total locks** (both the persisted and the in-memory state). Use it when starting a fresh account/challenge, or to manually lift a latched lock. Remember to set it back to `false` afterwards. A lock re-latches immediately if its limit is still enabled and the equity still breaches it. |
 
 #### === SYNC FILE ===
@@ -276,8 +281,8 @@ On a **Slave**, two extra things happen when `PropagateSlaveClose = true`:
 
 ### How the limits are calculated
 
-- **Initial balance** (`AccountDepositsAndWithdrawals`) = sum of deposits/withdrawals/credits/charges detected from account history (or `ForceInitialBalance` if you set it). This is the basis for percentage limits.
-- **Daily initial equity** = account equity at the daily reset time.
+- **Initial balance** (`AccountDepositsAndWithdrawals`) = sum of deposits/withdrawals/credits/charges detected from account history (or `ForceInitialBalance` if you set it). With `HistoryFromDate` set (prop-firm account reset), it is instead the **balance as of that moment**, and every history-based counter ignores older deals.
+- **Daily initial equity** = account equity at the daily reset time (or at `HistoryFromDate`, if the reset happened mid-day).
 
 **Total limits** (percent of initial balance):
 
@@ -511,6 +516,12 @@ A: With `AutoLotScaling = true` it copies the volume that gives the **same money
 
 **Q: What happens when the Slave's own SL/TP is hit before the Master's?**
 A: With `PropagateSlaveClose = true` (default), the Slave asks the Master to close the original position immediately (the Master polls every 200 ms), and every other Slave flattens as soon as the sync file updates. With `false`, the Slave keeps mirroring the file and would reopen the position on the next change.
+
+**Q: Can I use the EA on a single account, without copy trading?**
+A: Yes — set `Mode = NONE`. The full guardian (equity/count/streak/hours/forced close) and the news filter run on that account, gating your order-placing EA through the usual `HCPropsControllerDisableTrading` global variable, and **no shared files are created** (no sync file, no status file, no trade log).
+
+**Q: My prop firm "reset" my account (balance back to the original, history kept). What do I do?**
+A: Set `HistoryFromDate` to a moment just **after** the reset operation and reinitialize with `ResetCountersOnInit = true` once (then back to `false`). The EA then treats the account as if it started at that moment: the initial balance is the balance as of that time (the reset amount), and old trades no longer count toward the daily baseline or the trade/streak counters.
 
 **Q: What happens if a Slave terminal crashes or hangs?**
 A: Its heartbeat in `<syncfile>.slave.<login>` goes stale. With `ExpectedSlaves` set on the Master, the Master blocks new entries within ~`SlaveHeartbeatTimeoutSec` seconds and shows a red `Slaves alive` line — no new trade can be opened unhedged. Existing positions are still protected by the broker-side SL/TP that both legs always carry. When the Slave comes back, its heartbeat resumes and the Master unblocks automatically.

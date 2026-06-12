@@ -28,6 +28,35 @@ void CalculateAccountDepositsAndWithdrawals()
       AccountDepositsAndWithdrawals = ForceInitialBalance;
       return;
      }
+
+   // Account-reset support: with HistoryFromDate set, the account is treated as
+   // if it started at that moment - the initial balance is the BALANCE AS OF
+   // that time (prop firms reset the balance with a correction deal but keep
+   // the old trade history; summing balance ops would double-count it).
+   // Reconstruction: current balance minus every deal change since the date.
+   if(HistoryFromDate > 0)
+     {
+      CAccountInfo acc;
+      double currentBalance = acc.Balance();
+      if(HistorySelect(HistoryFromDate, TimeCurrent()))
+        {
+         double change = 0.0;
+         int total = HistoryDealsTotal();
+         CDealInfo deal;
+         for(int i = 0; i < total; i++)
+            if(deal.SelectByIndex(i))
+               change += deal.Profit() + deal.Commission() + deal.Swap();
+         double balAtDate = currentBalance - change;
+         if(balAtDate > 0.0)
+           {
+            AccountDepositsAndWithdrawals = balAtDate;
+            return;
+           }
+         Print("WARNING: balance as of HistoryFromDate computed as ", balAtDate,
+               " - falling back to the full-history deposit sum");
+        }
+     }
+
    AccountDepositsAndWithdrawals = 0.0;
    if(!HistorySelect(0, TimeCurrent()))
       return;
@@ -51,6 +80,8 @@ void CalculateInitialEquityDaily()
    ct.hour = DailyResetHour; ct.min = DailyResetMinute; ct.sec = 0;
    datetime todayReset = StructToTime(ct);
    datetime lastReset  = (TimeCurrent() >= todayReset) ? todayReset : todayReset - 86400;
+   if(HistoryFromDate > lastReset)
+      lastReset = HistoryFromDate; // account reset mid-day: the day starts there
 
    CAccountInfo acc;
    double currentBalance = acc.Balance();
@@ -93,7 +124,10 @@ datetime LastResetAnchor()
    MqlDateTime ct; TimeToStruct(TimeCurrent(), ct);
    ct.hour = DailyResetHour; ct.min = DailyResetMinute; ct.sec = 0;
    datetime todayReset = StructToTime(ct);
-   return (TimeCurrent() >= todayReset) ? todayReset : todayReset - 86400;
+   datetime anchor = (TimeCurrent() >= todayReset) ? todayReset : todayReset - 86400;
+   if(HistoryFromDate > anchor)
+      anchor = HistoryFromDate; // ignore trades from before an account reset
+   return anchor;
   }
 
 bool InUlongArray(const ulong &arr[], ulong v)

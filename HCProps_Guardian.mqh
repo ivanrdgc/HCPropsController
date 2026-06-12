@@ -31,9 +31,12 @@ void CalculateAccountDepositsAndWithdrawals()
 
    // Account-reset support: with HistoryFromDate set, the account is treated as
    // if it started at that moment - the initial balance is the BALANCE AS OF
-   // that time (prop firms reset the balance with a correction deal but keep
-   // the old trade history; summing balance ops would double-count it).
-   // Reconstruction: current balance minus every deal change since the date.
+   // that time, PLUS any later balance operations (deposits/corrections).
+   // Reconstruction: current balance minus the TRADING changes since the date.
+   // Balance-type deals (e.g. the firm's reset "Deposit-Topup") are part of the
+   // baseline, never trading P/L - so it does not matter whether the chosen
+   // moment falls before or after the firm's correction deal; it only has to be
+   // after the last OLD trade you want excluded.
    if(HistoryFromDate > 0)
      {
       CAccountInfo acc;
@@ -44,15 +47,24 @@ void CalculateAccountDepositsAndWithdrawals()
          int total = HistoryDealsTotal();
          CDealInfo deal;
          for(int i = 0; i < total; i++)
-            if(deal.SelectByIndex(i))
-               change += deal.Profit() + deal.Commission() + deal.Swap();
-         double balAtDate = currentBalance - change;
-         if(balAtDate > 0.0)
            {
-            AccountDepositsAndWithdrawals = balAtDate;
+            if(!deal.SelectByIndex(i))
+               continue;
+            long dt = deal.DealType();
+            if(dt != DEAL_TYPE_BUY && dt != DEAL_TYPE_SELL)
+               continue; // balance ops rebase the baseline, they are not P/L
+            change += deal.Profit() + deal.Commission() + deal.Swap();
+           }
+         double baseline = currentBalance - change;
+         if(baseline > 0.0)
+           {
+            AccountDepositsAndWithdrawals = baseline;
+            Print("HistoryFromDate: initial balance = ", DoubleToString(baseline, 2),
+                  " (balance as of ", TimeToString(HistoryFromDate, TIME_DATE | TIME_MINUTES),
+                  " incl. later balance operations)");
             return;
            }
-         Print("WARNING: balance as of HistoryFromDate computed as ", balAtDate,
+         Print("WARNING: baseline as of HistoryFromDate computed as ", baseline,
                " - falling back to the full-history deposit sum");
         }
      }
@@ -88,12 +100,21 @@ void CalculateInitialEquityDaily()
    if(!HistorySelect(lastReset + 1, TimeCurrent()))
      { InitialEquityDaily = AccountDepositsAndWithdrawals; return; }
 
+   // Only TRADING changes count: a deposit/correction (e.g. an account-reset
+   // top-up) landing after the anchor rebases the day baseline instead of
+   // counting as "today's profit" and instantly tripping the daily limit.
    int total = HistoryDealsTotal();
    double change = 0.0;
    CDealInfo deal;
    for(int i = 0; i < total; i++)
-      if(deal.SelectByIndex(i))
-         change += deal.Profit() + deal.Commission() + deal.Swap();
+     {
+      if(!deal.SelectByIndex(i))
+         continue;
+      long dt = deal.DealType();
+      if(dt != DEAL_TYPE_BUY && dt != DEAL_TYPE_SELL)
+         continue;
+      change += deal.Profit() + deal.Commission() + deal.Swap();
+     }
 
    InitialEquityDaily = currentBalance - change;
    if(InitialEquityDaily <= 0.0 && currentBalance > 0.0 && AccountDepositsAndWithdrawals > 0.0)

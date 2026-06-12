@@ -4,7 +4,7 @@
 //|  Single EA, file-based sync on the same VPS. No backend/license. |
 //+------------------------------------------------------------------+
 #property strict
-#property version "2.40"
+#property version "2.41"
 #property description "HCPropsController: Master/Slave copy trading, prop-firm limits and news filter in a single EA."
 #property description "v2.40: NONE mode (risk management on a single account, no replication files) and"
 #property description "HistoryFromDate for prop-firm account resets (ignore history before a chosen moment;"

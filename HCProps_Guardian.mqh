@@ -201,10 +201,13 @@ void CountCurrentTrades()
          CurrentTradesCount++;
   }
 
+// Computes the consecutive streaks AND the daily net W/L tally (wins -1/+1
+// losses) over today's closed trades - both feed the guardian.
 void CountConsecutiveWinsLosses()
   {
    ConsecutiveWinsToday = 0;
    ConsecutiveLossesToday = 0;
+   NetTradesToday = 0;
    datetime from = LastResetAnchor();
    datetime to   = TimeCurrent() + 60;
    if(!HistorySelect(from, to))
@@ -231,6 +234,14 @@ void CountConsecutiveWinsLosses()
    int n = ArraySize(profits);
    if(n == 0)
       return;
+
+   // Net tally over all of today's closed trades (break-even = 0, ignored).
+   for(int i = 0; i < n; i++)
+     {
+      if(profits[i] > 0.0)      NetTradesToday++;
+      else if(profits[i] < 0.0) NetTradesToday--;
+     }
+
    if(profits[0] > 0.0)
      {
       ConsecutiveWinsToday = 1;
@@ -271,10 +282,13 @@ void PerformDailyReset()
    TradesOpenedToday = 0;
    ConsecutiveWinsToday = 0;
    ConsecutiveLossesToday = 0;
+   NetTradesToday = 0;
    IsDailyLimitTradingDisabled = false;
    IsDailyNumberTradingDisabled = false;
    IsConsecWinsDisabled = false;
    IsConsecLossesDisabled = false;
+   IsNetWinsDisabled = false;
+   IsNetLossesDisabled = false;
    GlobalVariableDel(GV_DAILY_LOCK);
    DashboardNeedsUpdate = true;
    PersistState();
@@ -294,6 +308,8 @@ string ActiveLockFlags()
    if(IsParallelTradesDisabled)     flags += "Parallel ";
    if(IsConsecWinsDisabled)         flags += "WinsStreak ";
    if(IsConsecLossesDisabled)       flags += "LossStreak ";
+   if(IsNetWinsDisabled)            flags += "NetWins ";
+   if(IsNetLossesDisabled)          flags += "NetLosses ";
    if(IsTradingHoursDisabled)       flags += "Hours ";
    if(IsNewsBlocked)                flags += "News ";
    if(IsSlaveLockTradingDisabled)   flags += "SlaveLock ";
@@ -306,8 +322,8 @@ void CheckAndUpdateTradingStatus()
   {
    bool anyBlock = IsGlobalTradingDisabled || IsDailyLimitTradingDisabled || IsDailyNumberTradingDisabled ||
                    IsParallelTradesDisabled || IsTradingHoursDisabled || IsConsecWinsDisabled ||
-                   IsConsecLossesDisabled || IsNewsBlocked || IsSlaveLockTradingDisabled ||
-                   IsSlaveDownTradingDisabled;
+                   IsConsecLossesDisabled || IsNetWinsDisabled || IsNetLossesDisabled ||
+                   IsNewsBlocked || IsSlaveLockTradingDisabled || IsSlaveDownTradingDisabled;
 
    if(!anyBlock)
      {
@@ -325,6 +341,7 @@ void CheckAndUpdateTradingStatus()
    //  position closes arrive via close requests)
    bool closeActivePositions = IsGlobalTradingDisabled || IsDailyLimitTradingDisabled ||
                                IsConsecWinsDisabled || IsConsecLossesDisabled ||
+                               IsNetWinsDisabled || IsNetLossesDisabled ||
                                (IsNewsBlocked && NewsMode == NEWS_CLOSE_ALL);
 
    if(!DidCloseOrders || (!DidClosePositions && closeActivePositions))
@@ -430,9 +447,18 @@ void CheckGuardRules()
    IsDailyNumberTradingDisabled = (MaxTradesPerDay > 0 && TradesOpenedToday >= MaxTradesPerDay);
    // --- Parallel trades ---
    IsParallelTradesDisabled = (MaxParallelTrades > 0 && CurrentTradesCount >= MaxParallelTrades);
-   // --- Streaks ---
+   // --- Streaks (recomputed each cycle from the trailing run) ---
    IsConsecWinsDisabled   = (MaxConsecWinsPerDay   > 0 && ConsecutiveWinsToday   >= MaxConsecWinsPerDay);
    IsConsecLossesDisabled = (MaxConsecLossesPerDay > 0 && ConsecutiveLossesToday >= MaxConsecLossesPerDay);
+
+   // --- Daily net W/L tally (wins +1 / losses -1; LATCHED until the reset, so a
+   // forced flatten close cannot move the tally back inside and re-enable) ---
+   if(MaxDailyNetWins > 0 && NetTradesToday >= MaxDailyNetWins && !IsNetWinsDisabled)
+     { IsNetWinsDisabled = true;
+       Print("Daily net WINS target reached (net=+", NetTradesToday, " >= ", MaxDailyNetWins, "). Stopping until reset."); }
+   if(MaxDailyNetLosses > 0 && NetTradesToday <= -MaxDailyNetLosses && !IsNetLossesDisabled)
+     { IsNetLossesDisabled = true;
+       Print("Daily net LOSSES limit reached (net=", NetTradesToday, " <= -", MaxDailyNetLosses, "). Stopping until reset."); }
 
    CheckTradingHours();
    CheckAndUpdateTradingStatus();

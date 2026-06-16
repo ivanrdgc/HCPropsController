@@ -227,6 +227,17 @@ void UpdateDashboard()
       if(MaxConsecLossesPerDay > 0)
         { color c = BandColor((double)ConsecutiveLossesToday / MaxConsecLossesPerDay);
           CreateOrUpdateLabel("HCProps_ConsecLosses", 30, y, "Loss streak: " + IntegerToString(ConsecutiveLossesToday) + " / " + IntegerToString(MaxConsecLossesPerDay), c, 9, false, 17); y += lh + 3; }
+      if(MaxDailyNetWins > 0 || MaxDailyNetLosses > 0)
+        {
+         double nf = 0.0;
+         if(NetTradesToday > 0 && MaxDailyNetWins   > 0) nf = (double)NetTradesToday    / MaxDailyNetWins;
+         if(NetTradesToday < 0 && MaxDailyNetLosses > 0) nf = (double)(-NetTradesToday) / MaxDailyNetLosses;
+         string up = MaxDailyNetWins   > 0 ? "+" + IntegerToString(MaxDailyNetWins)   : "off";
+         string dn = MaxDailyNetLosses > 0 ? "-" + IntegerToString(MaxDailyNetLosses) : "off";
+         string ns = (NetTradesToday >= 0 ? "+" : "") + IntegerToString(NetTradesToday);
+         CreateOrUpdateLabel("HCProps_NetWL", 30, y, "Net W/L: " + ns + "  (max " + up + " / min " + dn + ")",
+                             BandColor(nf), 9, false, 26); y += lh + 3;
+        }
 
       if(LimitTradingHours)
         {

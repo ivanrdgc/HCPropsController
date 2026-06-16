@@ -4,11 +4,10 @@
 //|  Single EA, file-based sync on the same VPS. No backend/license. |
 //+------------------------------------------------------------------+
 #property strict
-#property version "2.41"
+#property version "2.50"
 #property description "HCPropsController: Master/Slave copy trading, prop-firm limits and news filter in a single EA."
-#property description "v2.40: NONE mode (risk management on a single account, no replication files) and"
-#property description "HistoryFromDate for prop-firm account resets (ignore history before a chosen moment;"
-#property description "initial balance becomes the balance as of that time)."
+#property description "v2.50: daily net W/L tally limit (wins +1 / losses -1, stop at an upper/lower bound)."
+#property description "v2.40: NONE mode (single-account risk management) and HistoryFromDate (account resets)."
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -99,6 +98,8 @@ input int    MaxParallelTrades      = 1; // Parallel trades limit; 0 = no limit
 input int    MaxTradesPerDay        = 1; // Trades per day limit; 0 = no limit
 input int    MaxConsecLossesPerDay  = 0; // Consecutive losses per day limit; 0 = no limit
 input int    MaxConsecWinsPerDay    = 0; // Consecutive wins per day limit; 0 = no limit
+input int    MaxDailyNetWins        = 0; // Daily net W/L tally: stop at wins-losses >= +this; 0 = no limit
+input int    MaxDailyNetLosses      = 0; // Daily net W/L tally: stop at wins-losses <= -this; 0 = no limit
 
 input group "=== DAILY RESET ==="
 input int    DailyResetHour   = 0; // Daily reset hour (0-23)
@@ -159,6 +160,7 @@ int TradesOpenedToday   = 0;
 int CurrentTradesCount  = 0;
 int ConsecutiveWinsToday   = 0;
 int ConsecutiveLossesToday = 0;
+int NetTradesToday         = 0; // wins (+1) minus losses (-1) since the daily reset
 
 // Lock flags
 bool IsGlobalTradingDisabled    = false; // total limit (sticky until ResetCountersOnInit)
@@ -168,6 +170,8 @@ bool IsParallelTradesDisabled   = false;
 bool IsTradingHoursDisabled     = false;
 bool IsConsecWinsDisabled       = false;
 bool IsConsecLossesDisabled     = false;
+bool IsNetWinsDisabled          = false; // daily net W/L tally hit upper bound (latched until reset)
+bool IsNetLossesDisabled        = false; // daily net W/L tally hit lower bound (latched until reset)
 bool IsNewsBlocked              = false;
 bool TotalLocked                = false; // persistent state of the total lock
 bool DidCloseOrders             = false;

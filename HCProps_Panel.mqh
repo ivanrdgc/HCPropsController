@@ -218,6 +218,9 @@ void UpdateDashboard()
       if(MaxTradesPerDay > 0)
         { color c = BandColor((double)TradesOpenedToday / MaxTradesPerDay);
           CreateOrUpdateLabel("HCProps_TradesToday", 30, y, "Trades today: " + IntegerToString(TradesOpenedToday) + " / " + IntegerToString(MaxTradesPerDay), c, 9, false, 14); y += lh - 2; }
+      if(MaxTradesTotal > 0)
+        { color c = BandColor((double)TradesOpenedTotal / MaxTradesTotal);
+          CreateOrUpdateLabel("HCProps_TradesTotal", 30, y, "Trades total: " + IntegerToString(TradesOpenedTotal) + " / " + IntegerToString(MaxTradesTotal), c, 9, false, 27); y += lh - 2; }
       if(MaxParallelTrades > 0)
         { color c = BandColor((double)CurrentTradesCount / MaxParallelTrades);
           CreateOrUpdateLabel("HCProps_TradesParallel", 30, y, "Parallel: " + IntegerToString(CurrentTradesCount) + " / " + IntegerToString(MaxParallelTrades), c, 9, false, 15); y += lh - 2; }

@@ -46,7 +46,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 
 ## Features at a Glance
 
-- **Prop-firm risk guardian (every mode)** — daily and total profit/loss limits (checked every 200 ms), max parallel trades, max trades per day, consecutive win/loss streak limits, a daily net win/loss tally limit, trading-hours window, and a forced close time, enforced independently on every account — including standalone accounts via `Mode = NONE` (guardian only, no shared files). When a limit is hit it closes positions, deletes pending orders, and disables trading. With `PropagateSlaveClose`, a Slave breach also closes the originals on the Master and **locks the Master**: new orders are only accepted while *every* account has trading enabled. Survived a prop-firm **account reset**? `HistoryFromDate` makes the EA ignore all older history and re-baseline from the reset moment.
+- **Prop-firm risk guardian (every mode)** — daily and total profit/loss limits (checked every 200 ms), max parallel trades, max trades per day, max total (cumulative) trades, consecutive win/loss streak limits, a daily net win/loss tally limit, trading-hours window, and a forced close time, enforced independently on every account — including standalone accounts via `Mode = NONE` (guardian only, no shared files). When a limit is hit it closes positions, deletes pending orders, and disables trading. With `PropagateSlaveClose`, a Slave breach also closes the originals on the Master and **locks the Master**: new orders are only accepted while *every* account has trading enabled. Survived a prop-firm **account reset**? `HistoryFromDate` makes the EA ignore all older history and re-baseline from the reset moment.
 - **Dead-Slave detection** — every Slave publishes a heartbeat; with `ExpectedSlaves` set, the Master blocks new entries the moment a Slave terminal goes silent, so nothing trades unhedged. A per-account **trade log** (`TradePairLog`) records every closed position for hedge-leakage reconciliation.
 - **Copy trading** — replicate one MASTER account onto any number of SLAVE accounts on the same machine, with auto lot scaling by point value, lot multiplier, symbol mapping, inverse mode, distance-based SL/TP (measured from each account's own fill price), and Slave→Master close propagation (a Slave-side SL/TP/manual close flattens the Master and every other Slave within ~half a second).
 - **News filter** — pause or close trading around economic news using MT5's native economic calendar (fully offline).
@@ -150,7 +150,8 @@ Runs the full guardian and the news filter on one account **without any copy tra
 | Parameter | Variable | Default | Description |
 |-----------|----------|---------|-------------|
 | Parallel trades limit | `MaxParallelTrades` | `1` | Max positions open at the same time. `0` = no limit. |
-| Trades per day limit | `MaxTradesPerDay` | `1` | Max trades opened per day. `0` = no limit. |
+| Trades per day limit | `MaxTradesPerDay` | `1` | Max trades opened per day (resets at the daily reset). `0` = no limit. |
+| Total trades limit | `MaxTradesTotal` | `0` | Max trades opened in total — cumulative since the account start (or `HistoryFromDate`), **never resets daily**. `0` = no limit. |
 | Consecutive losses per day limit | `MaxConsecLossesPerDay` | `0` | Max consecutive losing trades (resets to 0 on any win). `0` = no limit. |
 | Consecutive wins per day limit | `MaxConsecWinsPerDay` | `0` | Max consecutive winning trades (resets to 0 on any loss). `0` = no limit. |
 | Daily net wins limit | `MaxDailyNetWins` | `0` | Daily **net** tally: each won trade `+1`, each lost trade `−1`, starting at 0 each day. Stop when the tally reaches **`+this`**. `0` = no limit. |
@@ -276,6 +277,7 @@ On a **Slave**, two extra things happen when `PropagateSlaveClose = true`:
 | **Total** profit/loss (equity) | Closes all positions + deletes pending orders + disables trading. **Sticky** — stays locked even if equity recovers. | Only by setting `ResetCountersOnInit = true` and reinitializing. |
 | **Daily** profit/loss (equity) | Closes all positions + deletes pending orders + disables trading. **Sticky** for the rest of the day. | At the next daily reset. |
 | Max trades per day | Blocks new entries + deletes pending orders. Open positions are kept. | At the next daily reset. |
+| Max total trades | Blocks new entries + deletes pending orders. Open positions are kept. | Never (cumulative). Recounted from history, so it also survives restarts. Only `HistoryFromDate` (account reset) moves the start point. |
 | Max parallel trades | Blocks new entries + deletes pending orders. If the open count **exceeds** the limit, closes the **newest** position(s) down to the limit (a position count merely *equal* to the limit is kept, to avoid open/close churn). | When position count drops below the limit. |
 | Consecutive wins / losses | Closes all positions + deletes pending orders + disables trading. | At the next daily reset. |
 | Daily net wins / losses tally | Closes all positions + deletes pending orders + disables trading. **Latched** for the rest of the day. | At the next daily reset. |
@@ -359,7 +361,7 @@ The panel shows `NEWS ACTIVE: <event> (ends in Xm)` in red during protection. Th
 
 The EA draws an on-chart dashboard with everything important. It only redraws the labels that changed, to avoid flicker.
 
-**Both modes show** (when `PropFirmMode = true`): mode (guardian on / sync- or copy-only), the sync **file** in use, trading status (ENABLED/DISABLED), active locks, initial balance, day-start equity, live equity with daily/total %, configured daily/total limits with color bands, trades today / parallel / win & loss streaks / daily net W/L tally vs. their caps, the trading-hours window, news status with the **next two events that will pause trading** (and a countdown while a news block is active), the next daily reset, and the forced-close time.
+**Both modes show** (when `PropFirmMode = true`): mode (guardian on / sync- or copy-only), the sync **file** in use, trading status (ENABLED/DISABLED), active locks, initial balance, day-start equity, live equity with daily/total %, configured daily/total limits with color bands, trades today / trades total / parallel / win & loss streaks / daily net W/L tally vs. their caps, the trading-hours window, news status with the **next two events that will pause trading** (and a countdown while a news block is active), the next daily reset, and the forced-close time.
 
 **SLAVE adds:** invert/multiplier/auto-lots/copy-mode summary and the connection status (CONNECTED / WAITING FOR MASTER).
 

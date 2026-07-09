@@ -159,16 +159,16 @@ bool InUlongArray(const ulong &arr[], ulong v)
    return false;
   }
 
-// Counts DISTINCT trades, not IN deals: partial fills produce several IN deals
-// for one position (dedupe by position id), and on a Slave a re-replicated
-// Master ticket (direction flip, reopen after a missed close request) must not
-// inflate the count (dedupe by the HC<masterTicket> comment when present).
-void CountTradesOpenedToday()
+// Counts DISTINCT trades opened in [from, now], not IN deals: partial fills
+// produce several IN deals for one position (dedupe by position id), and on a
+// Slave a re-replicated Master ticket (direction flip, reopen after a missed
+// close request) must not inflate the count (dedupe by the HC<masterTicket>
+// comment when present).
+int CountTradesOpenedSince(datetime from)
   {
-   TradesOpenedToday = 0;
-   datetime from = LastResetAnchor();
+   int count = 0;
    if(!HistorySelect(from, TimeCurrent() + 60))
-      return;
+      return 0;
    int total = HistoryDealsTotal();
    CDealInfo deal;
    ulong seen[];
@@ -189,8 +189,17 @@ void CountTradesOpenedToday()
       int n = ArraySize(seen);
       ArrayResize(seen, n + 1);
       seen[n] = key;
-      TradesOpenedToday++;
+      count++;
      }
+   return count;
+  }
+
+// Trades opened since the daily reset anchor (resets each day) and since the
+// account start / HistoryFromDate (cumulative, never resets).
+void CountTradesOpenedToday()
+  {
+   TradesOpenedToday = CountTradesOpenedSince(LastResetAnchor());
+   TradesOpenedTotal = CountTradesOpenedSince(HistoryFromDate); // HistoryFromDate=0 -> whole history
   }
 
 void CountCurrentTrades()
@@ -305,6 +314,7 @@ string ActiveLockFlags()
    if(IsGlobalTradingDisabled)      flags += "Total ";
    if(IsDailyLimitTradingDisabled)  flags += "Daily ";
    if(IsDailyNumberTradingDisabled) flags += "Trades/Day ";
+   if(IsTotalNumberTradingDisabled) flags += "Trades/Total ";
    if(IsParallelTradesDisabled)     flags += "Parallel ";
    if(IsConsecWinsDisabled)         flags += "WinsStreak ";
    if(IsConsecLossesDisabled)       flags += "LossStreak ";
@@ -321,8 +331,8 @@ string ActiveLockFlags()
 void CheckAndUpdateTradingStatus()
   {
    bool anyBlock = IsGlobalTradingDisabled || IsDailyLimitTradingDisabled || IsDailyNumberTradingDisabled ||
-                   IsParallelTradesDisabled || IsTradingHoursDisabled || IsConsecWinsDisabled ||
-                   IsConsecLossesDisabled || IsNetWinsDisabled || IsNetLossesDisabled ||
+                   IsTotalNumberTradingDisabled || IsParallelTradesDisabled || IsTradingHoursDisabled ||
+                   IsConsecWinsDisabled || IsConsecLossesDisabled || IsNetWinsDisabled || IsNetLossesDisabled ||
                    IsNewsBlocked || IsSlaveLockTradingDisabled || IsSlaveDownTradingDisabled;
 
    if(!anyBlock)
@@ -443,8 +453,9 @@ void CheckGuardRules()
 
    CheckEquityLimits();
 
-   // --- Trades per day ---
+   // --- Trades per day / total (block new entries; keep open positions) ---
    IsDailyNumberTradingDisabled = (MaxTradesPerDay > 0 && TradesOpenedToday >= MaxTradesPerDay);
+   IsTotalNumberTradingDisabled = (MaxTradesTotal  > 0 && TradesOpenedTotal >= MaxTradesTotal);
    // --- Parallel trades ---
    IsParallelTradesDisabled = (MaxParallelTrades > 0 && CurrentTradesCount >= MaxParallelTrades);
    // --- Streaks (recomputed each cycle from the trailing run) ---

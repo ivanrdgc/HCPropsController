@@ -322,6 +322,7 @@ string ActiveLockFlags()
    if(IsNetLossesDisabled)          flags += "NetLosses ";
    if(IsTradingHoursDisabled)       flags += "Hours ";
    if(IsNewsBlocked)                flags += "News ";
+   if(ForceExitPending)             flags += "ForceExit ";
    if(IsSlaveLockTradingDisabled)   flags += "SlaveLock ";
    if(IsSlaveDownTradingDisabled)   flags += "SlaveDown ";
    StringTrimRight(flags);
@@ -330,10 +331,16 @@ string ActiveLockFlags()
 
 void CheckAndUpdateTradingStatus()
   {
+   if(ForceExitPending && PositionsTotal() == 0 && OrdersTotal() == 0)
+     {
+      ForceExitPending = false;
+      CalculateNextForceExitTime();
+      Print("Forced close completed. Next: ", TimeToString(NextForceExitTime));
+     }
    bool anyBlock = IsGlobalTradingDisabled || IsDailyLimitTradingDisabled || IsDailyNumberTradingDisabled ||
                    IsTotalNumberTradingDisabled || IsParallelTradesDisabled || IsTradingHoursDisabled ||
                    IsConsecWinsDisabled || IsConsecLossesDisabled || IsNetWinsDisabled || IsNetLossesDisabled ||
-                   IsNewsBlocked || IsSlaveLockTradingDisabled || IsSlaveDownTradingDisabled;
+                    IsNewsBlocked || IsSlaveLockTradingDisabled || IsSlaveDownTradingDisabled || ForceExitPending;
 
    if(!anyBlock)
      {
@@ -352,14 +359,14 @@ void CheckAndUpdateTradingStatus()
    bool closeActivePositions = IsGlobalTradingDisabled || IsDailyLimitTradingDisabled ||
                                IsConsecWinsDisabled || IsConsecLossesDisabled ||
                                IsNetWinsDisabled || IsNetLossesDisabled ||
-                               (IsNewsBlocked && NewsMode == NEWS_CLOSE_ALL);
+                                (IsNewsBlocked && NewsMode == NEWS_CLOSE_ALL) || ForceExitPending;
 
-   if(!DidCloseOrders || (!DidClosePositions && closeActivePositions))
+   if(OrdersTotal() > 0 || (closeActivePositions && PositionsTotal() > 0) ||
+      !DidCloseOrders || (!DidClosePositions && closeActivePositions))
      {
-      DidCloseOrders = true;
+      // A submitted request, including a partial fill, is not confirmed flattening.
       if(closeActivePositions)
         {
-         DidClosePositions = true;
          // SLAVE breach that flattens: ask the Master to close the originals first
          // (status file hits the disk BEFORE we start closing), so the Master and
          // every other Slave flatten too.
@@ -370,6 +377,8 @@ void CheckAndUpdateTradingStatus()
            }
         }
       CloseAllPositions(closeActivePositions);
+      DidCloseOrders = (OrdersTotal() == 0);
+      DidClosePositions = (closeActivePositions && PositionsTotal() == 0);
      }
 
    NotifyLockStateIfChanged();
@@ -425,6 +434,7 @@ void CheckEquityLimits()
         {
          TotalLocked = true;
          GlobalVariableSet(GV_TOTAL_LOCK, 1.0);
+         GlobalVariablesFlush();
          Print("TOTAL limit reached (persistent lock until ResetCountersOnInit). Equity: ", eq);
         }
      }
@@ -473,21 +483,42 @@ void CheckGuardRules()
 
    CheckTradingHours();
    CheckAndUpdateTradingStatus();
+   CheckIdeaLimits();
   }
 
 //===================================================================
 // CLOSE POSITIONS / ORDERS
 //===================================================================
+#ifndef HC_CLOSE_TRADE_CLASS
+#define HC_CLOSE_TRADE_CLASS CTrade
+#endif
+ulong HCNextCloseAttemptMs = 0;
 void CloseAllPositions(bool closeActivePositions = false)
   {
-   CTrade trade;
+   ulong now = GetTickCount64();
+   if(now < HCNextCloseAttemptMs)
+      return;
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+     {
+      HCNextCloseAttemptMs = now + 5000;
+      return;
+     }
+   ulong retryDelay = 1000;
+   HC_CLOSE_TRADE_CLASS trade;
+   trade.SetAsyncMode(false);
    trade.SetDeviationInPoints(Slippage);
 
    for(int i = OrdersTotal() - 1; i >= 0; i--)
      {
       ulong ticket = OrderGetTicket(i);
-      if(ticket > 0)
-         trade.OrderDelete(ticket);
+      if(ticket == 0)
+         continue;
+      bool accepted = trade.OrderDelete(ticket);
+      uint rc = trade.ResultRetcode();
+      if(rc == TRADE_RETCODE_MARKET_CLOSED || rc == TRADE_RETCODE_CONNECTION)
+         retryDelay = 5000;
+      if(!accepted || rc != TRADE_RETCODE_DONE)
+         Print("HC pending delete retry: ticket=", ticket, " retcode=", rc);
      }
 
    if(closeActivePositions)
@@ -495,15 +526,20 @@ void CloseAllPositions(bool closeActivePositions = false)
       for(int i = PositionsTotal() - 1; i >= 0; i--)
         {
          ulong ticket = PositionGetTicket(i);
-         if(ticket > 0)
+         if(ticket > 0 && PositionSelectByTicket(ticket))
            {
-            CPositionInfo p;
-            if(p.SelectByTicket(ticket))
-               trade.SetTypeFillingBySymbol(p.Symbol());
-            trade.PositionClose(ticket);
+            trade.SetTypeFillingBySymbol(PositionGetString(POSITION_SYMBOL));
+            bool accepted = trade.PositionClose(ticket);
+            uint rc = trade.ResultRetcode();
+            if(rc == TRADE_RETCODE_MARKET_CLOSED || rc == TRADE_RETCODE_CONNECTION)
+               retryDelay = 5000;
+            if(!accepted || rc != TRADE_RETCODE_DONE || PositionSelectByTicket(ticket))
+               Print("HC position close retry: ticket=", ticket, " retcode=", rc);
            }
         }
      }
+   HCNextCloseAttemptMs = (OrdersTotal() > 0 || (closeActivePositions && PositionsTotal() > 0))
+                         ? now + retryDelay : 0;
   }
 
 // Close the 'howMany' most recently opened positions (used for the parallel-trades limit).
@@ -551,4 +587,3 @@ void CloseNewestPositions(int howMany)
      }
    Print("Parallel-trades limit: closed ", toClose, " newest position(s) over the limit of ", MaxParallelTrades);
   }
-

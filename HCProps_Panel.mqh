@@ -102,6 +102,8 @@ void UpdateDashboard()
    CAccountInfo acc;
    double eq = acc.Equity();
    int y = 20, lh = 20;
+   if(!PropFirmMode)
+     { ObjectDelete(0, "HCProps_IdeaLoss"); ObjectDelete(0, "HCProps_IdeaProfit"); }
 
    CreateOrUpdateLabel("HCProps_Title", 20, y, "=== HC Props Controller ===", clrDodgerBlue, 12, true, 0); y += lh + 5;
    string modeText;
@@ -215,6 +217,21 @@ void UpdateDashboard()
         { color c = BandColor(TotalLossLimitPercent > 0 ? (-tp) / TotalLossLimitPercent : 0);
           CreateOrUpdateLabel("HCProps_TotalLower", 30, y, "Total -: " + DoubleToString(TotalLowerLimitEquity, 2) + " (" + DoubleToString(TotalLossLimitPercent, 2) + "%)", c, 9, false, 13); y += lh + 3; }
 
+      for(int side = 0; side < 2; side++)
+        {
+         double pct = side == 0 ? MaxLossPercentPerIdea : MaxProfitPercentPerIdea;
+         string label = side == 0 ? "HCProps_IdeaLoss" : "HCProps_IdeaProfit";
+         if(pct > 0.0)
+           {
+            string text = (side == 0 ? "Idea loss: " : "Idea profit: ") + DoubleToString(pct, 2) + "% / " +
+                          DoubleToString(AccountDepositsAndWithdrawals * pct / 100.0, 2) + " " +
+                          AccountInfoString(ACCOUNT_CURRENCY) + " per group";
+            CreateOrUpdateLabel(label, 30, y, text, clrSilver, 9, false, 28 + side); y += lh - 2;
+           }
+         else
+           { ObjectDelete(0, label); LastDashboardValues[28 + side] = ""; }
+        }
+
       if(MaxTradesPerDay > 0)
         { color c = BandColor((double)TradesOpenedToday / MaxTradesPerDay);
           CreateOrUpdateLabel("HCProps_TradesToday", 30, y, "Trades today: " + IntegerToString(TradesOpenedToday) + " / " + IntegerToString(MaxTradesPerDay), c, 9, false, 14); y += lh - 2; }
@@ -273,4 +290,3 @@ void DeleteDashboard()
      }
    ChartRedraw(0);
   }
-

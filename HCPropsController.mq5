@@ -4,8 +4,9 @@
 //|  Single EA, file-based sync on the same VPS. No backend/license. |
 //+------------------------------------------------------------------+
 #property strict
-#property version "2.51"
+#property version "2.52"
 #property description "HCPropsController: Master/Slave copy trading, prop-firm limits and news filter in a single EA."
+#property description "v2.52: local guardian heartbeat, owned lifecycle and confirmed close retries."
 #property description "v2.51: total (cumulative) trades limit that never resets daily."
 #property description "v2.50: daily net W/L tally limit (wins +1 / losses -1, stop at an upper/lower bound)."
 
@@ -93,6 +94,10 @@ input double DailyLossLimitPercent   = 4.6; // Daily loss limit (%); 0 = no limi
 input double TotalProfitLimitPercent = 8.1; // Total profit limit (%); 0 = no limit
 input double TotalLossLimitPercent   = 8.1; // Total loss limit (%); 0 = no limit
 
+input group "=== OPEN IDEA LIMITS ==="
+input double MaxLossPercentPerIdea   = 0.0; // Floating loss per symbol + direction (% of initial base); 0 = off
+input double MaxProfitPercentPerIdea = 0.0; // Floating profit per symbol + direction (% of initial base); 0 = off
+
 input group "=== TRADING LIMITS ==="
 input int    MaxParallelTrades      = 1; // Parallel trades limit; 0 = no limit
 input int    MaxTradesPerDay        = 1; // Trades per day limit; 0 = no limit
@@ -134,6 +139,7 @@ string GV_DAILY_LOCK  = "HCPropsController_DailyLocked";
 string GV_INIT_BAL    = "HCPropsController_InitBalance";
 string GV_INIT_EQD    = "HCPropsController_InitEquityDaily";
 string GV_NEXT_RESET  = "HCPropsController_NextReset";
+string GV_HEARTBEAT   = "HCPropsControllerHeartbeat";
 
 //===================================================================
 // TRADING HELPERS (global lock signal)
@@ -179,6 +185,7 @@ bool IsNewsBlocked              = false;
 bool TotalLocked                = false; // persistent state of the total lock
 bool DidCloseOrders             = false;
 bool DidClosePositions          = false;
+bool ForceExitPending           = false; // runtime liquidation intent; cleared only after confirmed flat
 
 // Lock + heartbeat propagation (Slave guardian -> Master)
 bool   IsSlaveLockTradingDisabled = false; // MASTER: some Slave reports trading disabled
@@ -208,6 +215,8 @@ bool     MasterFileExists    = false;
 bool     SlaveWarningShown   = false;
 ulong    g_syncSeq           = 0;  // Master: write sequence (monotonic across EA restarts)
 int      g_timerTick         = 0;  // 200 ms timer tick counter (every 5th = ~1 s work)
+int      g_instanceFile      = INVALID_HANDLE;
+bool     g_initialized       = false;
 
 // News (cache)
 datetime g_newsTimes[];
@@ -225,6 +234,7 @@ datetime g_activeNewsEnd  = 0; // end of the currently active protection window
 #include "HCProps_News.mqh"
 #include "HCProps_Master.mqh"
 #include "HCProps_Slave.mqh"
+#include "HCProps_Idea.mqh"
 #include "HCProps_Panel.mqh"
 
 //===================================================================
@@ -232,7 +242,31 @@ datetime g_activeNewsEnd  = 0; // end of the currently active protection window
 //===================================================================
 int OnInit()
   {
-   Print("HCPropsController v2 initialized. Mode: ", ModeName());
+   g_initialized = false;
+   // These globals describe one account guardian, not independent per-chart controllers.
+   g_instanceFile = FileOpen("HCPropsController.lock", FILE_READ | FILE_WRITE | FILE_BIN);
+   if(g_instanceFile == INVALID_HANDLE)
+     {
+      Print("ERROR: cannot acquire the terminal guardian lock (another HC instance or file access error): ", GetLastError());
+      return INIT_FAILED;
+     }
+   GlobalVariableDel(GV_HEARTBEAT);
+   DisableTrading();
+   Print("HCPropsController v2.52 initialized. Mode: ", ModeName());
+
+   if(!HCIdeaInputsValid())
+     { Print("ERROR: idea percentages must be finite and >= 0"); return INIT_PARAMETERS_INCORRECT; }
+   ArrayResize(g_ideaGroups, 0);
+   g_ideaPersistenceOK = true;
+   g_ideaMasterInventoryValid = false;
+   for(int i = ArraySize(g_closedMasterTicket) - 1; i >= 0; i--)
+      if(HCIdeaCloseReason(g_closedMasterReason[i]))
+        {
+         ArrayRemove(g_closedMasterTicket, i, 1);
+         ArrayRemove(g_closedMasterWhen, i, 1);
+         ArrayRemove(g_closedMasterReason, i, 1);
+        }
+   HCIdeaRestoreSlaveCloses();
 
    // Time-range validations (the guardian runs in BOTH modes)
    if(DailyResetHour < 0 || DailyResetHour > 23 || DailyResetMinute < 0 || DailyResetMinute > 59)
@@ -315,16 +349,16 @@ int OnInit()
       IsDailyLimitTradingDisabled = false;
       DidCloseOrders = false;
       DidClosePositions = false;
-      EnableTrading();
+       // Keep initialization fail-closed until all enabled guards have a valid base.
       Print("ResetCountersOnInit: state cleared");
      }
 
    // Restore baseline + locks from GlobalVariables (survives restarts/VPS crashes)
    bool restored = false;
-   if(PropFirmMode && !ResetCountersOnInit && GlobalVariableCheck(GV_INIT_BAL))
-     {
-      if(GlobalVariableGet(GV_INIT_BAL) > 0)
-         AccountDepositsAndWithdrawals = GlobalVariableGet(GV_INIT_BAL);
+    if(PropFirmMode && !ResetCountersOnInit)
+      {
+       if(ForceInitialBalance <= 0.0 && GlobalVariableCheck(GV_INIT_BAL) && GlobalVariableGet(GV_INIT_BAL) > 0)
+          AccountDepositsAndWithdrawals = GlobalVariableGet(GV_INIT_BAL);
       InitialEquityDaily = GlobalVariableGet(GV_INIT_EQD);
       NextDailyResetTime = (datetime)GlobalVariableGet(GV_NEXT_RESET);
       TotalLocked = (GlobalVariableCheck(GV_TOTAL_LOCK) && GlobalVariableGet(GV_TOTAL_LOCK) == 1.0);
@@ -340,10 +374,13 @@ int OnInit()
       CalculateNextDailyResetTime();
      }
 
+   if(PropFirmMode && HCIdeaLimitsEnabled() && !HCIdeaBaseValid())
+     { Print("ERROR: enabled idea limits require a finite positive initial base and monetary thresholds"); return INIT_FAILED; }
+
    CalculateTotalLimits();
    CalculateDailyLimits();
-   if(ForceExitEnabled)
-      CalculateNextForceExitTime();
+   if(ForceExitEnabled && !ForceExitPending)
+       CalculateNextForceExitTime();
 
    Sleep(100);
    CountTradesOpenedToday();
@@ -354,10 +391,16 @@ int OnInit()
    if(restored && TimeCurrent() >= NextDailyResetTime)
       PerformDailyReset();
 
+   // Persist liquidation intent before any init path can publish permission/liveness.
+   CheckIdeaLimits(false);
+   if(!g_ideaPersistenceOK)
+     { Print("ERROR: idea liquidation intent could not be persisted"); return INIT_FAILED; }
    PersistState();
 
    if(PropFirmMode)
       CheckGuardRules();
+   if(!g_ideaPersistenceOK)
+     { DisableTrading(); Print("ERROR: idea intent persistence failed during init"); return INIT_FAILED; }
    CheckNews();
 
    Print(ModeName(), " OnInit: PropFirmMode=", PropFirmMode,
@@ -365,13 +408,18 @@ int OnInit()
 
    // 200 ms timer: fast Slave reaction / close-request processing.
    // Heavy 1-second work runs on every 5th tick (see OnTimer).
-   EventSetMillisecondTimer(200);
+    if(!EventSetMillisecondTimer(200))
+      {
+       Print("ERROR: guardian timer could not be started: ", GetLastError());
+       return INIT_FAILED;
+      }
 
    ArrayResize(LastDashboardValues, 64);
    for(int i = 0; i < 64; i++)
       LastDashboardValues[i] = "";
-   DashboardNeedsUpdate = true;
-   CreateDashboard();
+    DashboardNeedsUpdate = true;
+    CreateDashboard();
+    g_initialized = true;
 
    if(Mode == MODE_MASTER)
      {
@@ -395,9 +443,14 @@ int OnInit()
         }
       WriteSlaveStatusFile(); // publish heartbeat + lock state right away
      }
-   // MODE_NONE: guardian only - no shared files of any kind
+    // MODE_NONE: guardian only - no shared files of any kind
 
-   return INIT_SUCCEEDED;
+    if(GlobalVariableSet(GV_HEARTBEAT, (double)TimeLocal()) == 0)
+      {
+       Print("ERROR: guardian heartbeat could not be published: ", GetLastError());
+       return INIT_FAILED;
+      }
+    return INIT_SUCCEEDED;
   }
 
 //===================================================================
@@ -405,8 +458,14 @@ int OnInit()
 //===================================================================
 void OnTimer()
   {
+   if(!g_initialized)
+      return;
    g_timerTick++;
    bool fullTick = (g_timerTick % 5 == 0); // timer runs at 200 ms; ~1 s cadence for heavy work
+
+   CheckIdeaLimits(); // before copying: latch existing breaches before any reopen
+   if(fullTick && Mode == MODE_SLAVE)
+      HCIdeaRestoreSlaveCloses(); // keep durable requests/GVs alive even with the Master offline
 
    // ---- every 200 ms: the fast paths ----
    if(Mode == MODE_MASTER)
@@ -434,17 +493,12 @@ void OnTimer()
       if(TimeCurrent() >= NextDailyResetTime)
          PerformDailyReset();
 
-      if(ForceExitEnabled && NextForceExitTime > 0 && TimeCurrent() >= NextForceExitTime)
-        {
-         if(Mode == MODE_SLAVE && PropagateSlaveClose)
-           {
-            EnqueueAllReplicatedCloses("FORCE_EXIT"); // flatten the Master legs too
-            WriteSlaveStatusFile();
-           }
-         CloseAllPositions(true);
-         CalculateNextForceExitTime();
-         Print("Forced close executed. Next: ", TimeToString(NextForceExitTime));
-        }
+       if(ForceExitEnabled && !ForceExitPending && NextForceExitTime > 0 && TimeCurrent() >= NextForceExitTime)
+         {
+          ForceExitPending = true;
+          // A previous pending-only cancellation delay must not defer the first flatten attempt.
+          HCNextCloseAttemptMs = 0;
+         }
 
       CheckGuardRules();
      }
@@ -465,7 +519,13 @@ void OnTimer()
    else if(Mode == MODE_MASTER)
       PruneWarnedExcluded();
 
-   UpdateDashboard();
+    UpdateDashboard();
+    // Liveness is published only after the complete guardian/news cycle.
+    if(GlobalVariableSet(GV_HEARTBEAT, (double)TimeLocal()) == 0)
+      {
+       DisableTrading();
+       Print("ERROR: guardian heartbeat update failed: ", GetLastError());
+      }
   }
 
 //===================================================================
@@ -557,8 +617,24 @@ void SlavePropagateCloseFromDeal(ulong dealTicket)
 //===================================================================
 void OnDeinit(const int reason)
   {
-   EventKillTimer();
-   DeleteDashboard();
+   // INIT_FAILED on a rejected duplicate must not change the owner's globals or files.
+   if(g_instanceFile == INVALID_HANDLE)
+      return;
+    EventKillTimer();
+    DeleteDashboard();
+   GlobalVariableDel(GV_HEARTBEAT);
+   DisableTrading();
+   if(Mode == MODE_MASTER && GlobalVariableCheck(MasterMutexGVName()) &&
+      (long)GlobalVariableGet(MasterMutexGVName()) == ChartID())
+      GlobalVariableDel(MasterMutexGVName());
+   if(!g_initialized)
+     {
+      FileClose(g_instanceFile);
+      g_instanceFile = INVALID_HANDLE;
+      return;
+     }
+   PersistState();
+   GlobalVariablesFlush();
 
    if(Mode == MODE_MASTER)
      {
@@ -568,15 +644,6 @@ void OnDeinit(const int reason)
       if(FileIsExist(rel, FILE_COMMON))
          FileDelete(rel, FILE_COMMON);
 
-      // If the EA is removed for good (not a recompile), release the lock signal
-      // and the one-Master-per-file mutex.
-      if(reason == REASON_REMOVE || reason == REASON_CHARTCLOSE)
-        {
-         EnableTrading();
-         if(GlobalVariableCheck(MasterMutexGVName()) &&
-            (long)GlobalVariableGet(MasterMutexGVName()) == ChartID())
-            GlobalVariableDel(MasterMutexGVName());
-        }
      }
    else if(Mode == MODE_SLAVE)
      {
@@ -590,13 +657,10 @@ void OnDeinit(const int reason)
          string st = SlaveStatusPath();
          if(FileIsExist(st, FILE_COMMON))
             FileDelete(st, FILE_COMMON);
-         EnableTrading();
-        }
-     }
-   else // NONE: nothing on disk to clean up; just release the lock signal on removal
-     {
-      if(reason == REASON_REMOVE || reason == REASON_CHARTCLOSE)
-         EnableTrading();
-     }
+         }
+      }
+   g_initialized = false;
+   FileClose(g_instanceFile);
+   g_instanceFile = INVALID_HANDLE;
   }
 //+------------------------------------------------------------------+

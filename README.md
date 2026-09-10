@@ -18,6 +18,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
   - [MASTER Mode Parameters](#master-mode-parameters)
   - [SLAVE Mode Parameters](#slave-mode-parameters)
 - [Feature: Prop-Firm Guardian](#feature-prop-firm-guardian)
+- [Feature: Open-Idea Limits](#feature-open-idea-limits)
 - [Feature: Copy Trading (Master / Slave)](#feature-copy-trading-master--slave)
 - [Feature: News Filter](#feature-news-filter)
 - [Feature: Information Panel](#feature-information-panel)
@@ -36,7 +37,7 @@ Everything is driven from **one single Expert Advisor**. There is no server, no 
 | File | Type | Purpose |
 |------|------|---------|
 | `HCPropsController.mq5` | Expert Advisor | The core EA: Master/Slave copy trading + prop-firm risk guardian + news filter, all in one. |
-| `HCProps_*.mqh` (6 files) | EA modules | Source modules included by `HCPropsController.mq5` (util, guardian, news, master, slave, panel). Keep them in the same folder as the `.mq5` when compiling; the compiled `.ex5` is self-contained. |
+| `HCProps_*.mqh` (7 files) | EA modules | Source modules included by `HCPropsController.mq5` (util, guardian, news, master, slave, idea, panel). Keep them in the same folder as the `.mq5` when compiling; the compiled `.ex5` is self-contained. |
 | `Patch-SQX-GV-Disable.ps1` + `Run-Patcher.bat` | Windows tool | Patches EAs exported from StrategyQuant (SQX) so they obey HCPropsController's limits. |
 | `patch-gv-disable.py` | Cross-platform tool | Same patcher as above, for Linux / macOS / any system with Python 3. |
 
@@ -145,6 +146,16 @@ Runs the full guardian and the news filter on one account **without any copy tra
 
 > Set any limit to `0` to disable it. See [Prop-Firm Guardian](#feature-prop-firm-guardian) for how the limits are calculated.
 
+#### === OPEN IDEA LIMITS (All Modes) ===
+
+| Variable | Default | Description |
+|---|---|---|
+| `MaxLossPercentPerIdea` | `0.0` | Floating loss per open symbol/direction group, as a percent of the initial base. |
+| `MaxProfitPercentPerIdea` | `0.0` | Floating profit per open symbol/direction group, as a percent of the initial base. |
+
+See [Open-Idea Limits](#feature-open-idea-limits) for their floating-only scope,
+independent of account-wide limits.
+
 #### === TRADING LIMITS (Master and Slave) ===
 
 | Parameter | Variable | Default | Description |
@@ -184,6 +195,20 @@ Outside the window, new entries are blocked and pending orders are removed; open
 |-----------|----------|---------|-------------|
 | Force close at the specified time | `ForceExitEnabled` | `true` | Enable a daily forced close. |
 | Forced close hour / minute | `TradingExitHour` / `TradingExitMinute` | `22` / `0` | At this time, **all positions are closed** and pending orders deleted. |
+
+At the scheduled time, HC latches a runtime `ForceExitPending` liquidation intent
+and makes the first flatten attempt without inheriting a previous pending-order
+cancellation backoff. New entries stay blocked while the fast guardian path retries
+rejected or partial closes, respecting the normal one-/five-second retry delays.
+The next schedule and `Forced close completed` message are published only after
+the inventory confirms zero positions **and** zero pending orders. Other locks,
+including a news pause, are not cleared by completion.
+
+An in-memory inputs reinitialization does not clear an already pending forced exit
+or replace its due time. It remains an in-progress liquidation, even if future
+forced exits are disabled. This runtime intent is not a new persisted account lock:
+a full unload/terminal restart loses it and initializes the next schedule normally.
+No fill or maximum-loss guarantee is implied when the broker cannot execute.
 
 #### === NEWS PROTECTION (Master and Slave) ===
 
@@ -282,7 +307,7 @@ On a **Slave**, two extra things happen when `PropagateSlaveClose = true`:
 | Consecutive wins / losses | Closes all positions + deletes pending orders + disables trading. | At the next daily reset. |
 | Daily net wins / losses tally | Closes all positions + deletes pending orders + disables trading. **Latched** for the rest of the day. | At the next daily reset. |
 | Outside trading hours | Blocks new entries + deletes pending orders. | Inside the trading window. |
-| Forced close time | Closes all positions + deletes pending orders. | — (one-shot at the configured time). |
+| Forced close time | Blocks entries and retries closing all positions + deleting pending orders. | After inventory confirms flat; other active locks remain. |
 
 "Disabling trading" sets the MT5 Global Variable `HCPropsControllerDisableTrading` to `1.0`. Any EA that checks this variable — such as SQX EAs processed by the [patcher](#tool-strategyquant-ea-patcher) — will stop opening new positions while it is set.
 
@@ -380,7 +405,153 @@ Connection and status labels also use green for the good state (trading enabled,
 
 ---
 
+## Feature: Open-Idea Limits
+
+`MaxLossPercentPerIdea = 0.0` and `MaxProfitPercentPerIdea = 0.0` are generic,
+optional defaults. Only `PropFirmMode = true` activates the local idea guardian,
+in MASTER, SLAVE or NONE mode. It checks before initialization publishes the
+local heartbeat, every 200 ms (before Slave reconciliation), and through
+`CheckGuardRules` on trade events. It is a best-effort software close, not a
+broker-guaranteed stop or a guarantee of compliance with a firm's rulebook.
+
+An **idea is all currently open positions with exactly the same broker symbol
+and local direction (BUY or SELL)**, including manual trades and every EA/magic.
+There is no time window or magic filter for the monetary calculation or local
+liquidation. The opposite direction and other symbols form separate groups.
+
+```text
+base = AccountDepositsAndWithdrawals (same reference as total limits)
+groupPnl = SUM(POSITION_PROFIT + POSITION_SWAP) over OPEN positions in the group
+loss trigger:   lossPercent > 0   AND groupPnl <= -base * lossPercent / 100
+profit trigger: profitPercent > 0 AND groupPnl >=  base * profitPercent / 100
+```
+
+Both boundaries are inclusive. The existing `ForceInitialBalance` override and
+baseline restoration/recalculation apply. The daily equity formula is unchanged.
+Negative or non-finite percentages return `INIT_PARAMETERS_INCORRECT`, even if
+the guardian is disabled. With an enabled idea limit, initialization fails
+without permission/heartbeat if the base is not finite and positive or a monetary
+threshold is non-finite/non-positive. Initialization also fails if it cannot
+persist activated close intent. `ResetCountersOnInit` does not briefly enable
+entries before these checks finish.
+
+This is a **floating guard per open group**, not closed-trade accounting. It does
+not include commissions/fees already charged to balance, historical closed P/L
+(including realized parts of partial closes), estimated future exit fees, profits
+from other directions/symbols, or a prop firm's temporal grouping of trades.
+It does not emulate a ten-minute grouping rule. The 200 ms path uses live
+positions and Global Variables, not a full `HistorySelect` scan.
+
+On a breach, the guard persists every group member's liquidation intent before
+sending close requests. Rejected and partially filled requests are retried even
+after a P/L rebound or a valid base change. Retry spacing is normally one second,
+five seconds for disconnection/market-closed responses; repeated failure logs are
+limited to once per group per 30 seconds. Activation logs include reason, symbol,
+direction, P/L, base and signed threshold; retry logs include ticket and retcode.
+Every pass with a latched member absorbs late positions in the same group before
+retrying. Confirmed closed-position latches are removed; a confirmed flat group
+can start a new idea immediately, with no cooldown. Direction is part of the
+latch, so a netting reversal does not inherit the opposite side's intent.
+
+The rule only closes positions. It does **not** delete pending orders, modify or
+remove SL/TP, set `TotalLocked`, or disable trading for the account. Existing
+independent account/news/trade-count rules still apply. In particular,
+`NEWS_PAUSE_OPEN` does not create preventive exits, but it does not veto an
+idea's monetary-limit close. Such a close can occur during a news window.
+
+**Turning both percentages back to zero disables new triggers, but deliberately
+finishes an already activated liquidation while `PropFirmMode` remains true.**
+With no old intent, zero/zero leaves the previous trading logic unchanged.
+`ResetCountersOnInit` and daily resets do not erase idea latches or copier
+tombstones. `PropFirmMode = false` suspends local idea liquidation, not existing
+copier anti-reopen memory or already queued close requests.
+
+### Copier and Persistence
+
+MASTER group closes reach Slaves through normal synchronization. On a SLAVE,
+the local symbol/direction is already mapped/inverted, so the same monetary rule
+works for normal and inverse copying. Only the group's known replicated tickets
+are queued for Master close, before local close, with `IDEA_LOSS` or `IDEA_PROFIT`
+when `PropagateSlaveClose = true`. There is no `EnqueueAllReplicatedCloses` call
+for this rule. With propagation false, the close is local only.
+
+Each closed replicated ticket gets a durable anti-reopen tombstone regardless of
+propagation. It blocks only that Master ticket, not unrelated/new targets, survives
+restarts and does not expire after the ordinary 120-second close-request TTL.
+Idea requests also survive restart and remain queued until acknowledgement;
+ordinary close reasons retain their previous TTL behavior. Slave reconciliation
+leaves latched positions to the idea guard, without bypassing its retry backoff.
+
+An acknowledgement requires a complete, valid SEQ/END Master snapshot in which
+the original ticket is absent, plus confirmation that its local copy is closed.
+The raw Master inventory is checked, not targets filtered out by symbol/lot
+availability. While tombstones exist, even an unchanged SEQ is read to END.
+Missing/unreadable/torn files, legacy snapshots without SEQ/END, and timeouts
+never purge these tombstones. The structural Master/Slave file formats are unchanged.
+
+Terminal Global Variable keys use full-width hexadecimal integers (no hashes,
+truncation or floating-point ticket encoding):
+
+| Key | Scope / value |
+|---|---|
+| `HCI1_<login16>_<positionIdentifier16>_<direction>` (40 characters) | Local liquidation intent; value 1 = loss, 2 = profit |
+| `HCT1_<login16>_<magic16>_<masterTicket16>` (55 characters) | Copier tombstone; absolute value 1 = loss, 2 = profit; positive = propagation requested at activation, negative = local only |
+
+Tombstones are scoped by **account + copier magic + Master ticket**, not sync path.
+Use a distinct magic for a different copy source; do not reuse a magic for another
+Master with overlapping ticket numbers. A locally-only tombstone stays locally-only
+if propagation is later enabled; turning propagation off suppresses publication of
+previously queued requests without forgetting them. The persistence survives normal
+restarts but remains subject to MT5's four-week expiry for unused Global Variables;
+active reads refresh their lifetime. Do not manually delete this state during a
+liquidation.
+
+The panel adds optional loss/profit lines showing percent and money **per group**
+in the account currency. Each line disappears when its percentage is zero.
+
+### Source Packaging and Tests
+
+Source packagers must include the new `HCProps_Idea.mqh` alongside the six existing
+modules and accept **46 input parameters** (previously 44), excluding input-group
+headings. Add the two new input names explicitly to any input allowlist; keep both
+generic defaults zero. Account-specific variants, presets and deployment policy
+belong outside this repository. The shipped generic EX5 was rebuilt and checked
+against these sources; see [validation results and binary hash](tests/RESULTS.md)
+and [native test cases](tests/IDEA-CASES.md). Implementation review or arithmetic
+tests alone are not native integration validation.
+
 ## Feature: Crash-Safe State Persistence
+
+### Local Guardian Heartbeat (v2.52)
+
+`HCPropsControllerHeartbeat` is a terminal Global Variable containing `TimeLocal()`.
+HC publishes it after successful initialization and refreshes it after each full
+guardian/news timer cycle (about one second), including when there are no ticks.
+It is independent of the Slave-to-Master status-file heartbeat. Consumers can
+require an age between 0 and 5 seconds and must also check the trading lock flags.
+A fresh heartbeat means the controller is running, not that trading is permitted
+or every broker-specific rule is covered.
+
+Use **one HC instance per terminal**: all modes share account-wide guardian globals.
+v2.52 holds an exclusive local `MQL5/Files/HCPropsController.lock` handle and rejects
+another instance before changing shared state. The empty file may remain after exit;
+its existence is not the lock. Older builds do not honor this mutex: remove the old
+instance when upgrading, rather than attaching both. Independent copy groups belong
+in separate terminal instances.
+
+On removal, restart, input changes or initialization failure, the owning instance
+removes its heartbeat and leaves new entries disabled. It never clears economic locks
+as cleanup. A rejected duplicate does not touch the running owner's state. The timer
+must start successfully before a heartbeat is published. Restore defaults using the
+Inputs dialog if desired; do **not** enable `ResetCountersOnInit` merely to upgrade.
+
+v2.52 also restores locks independently of baseline metadata, respects an explicitly
+forced initial balance over a persisted one, and retries rejected/partial liquidation
+requests until the terminal inventory confirms completion. It does not add a new reason
+to close positions or change the daily-limit formula by itself. The separate optional
+[open-idea guard](#feature-open-idea-limits) adds floating group limits without changing
+`PAUSE_OPEN` news handling. `PAUSE_OPEN` does not suppress broker SL/TP execution
+or another EA's exits; those can still fall inside a restricted news window.
 
 When `PropFirmMode = true`, the guardian persists its state in MT5 Global Variables so it survives EA reinitialization, terminal restarts, and VPS reboots:
 
@@ -392,6 +563,7 @@ When `PropFirmMode = true`, the guardian persists its state in MT5 Global Variab
 | `HCPropsController_TotalLocked` | Sticky total-lock flag |
 | `HCPropsController_DailyLocked` | Daily equity-lock flag |
 | `HCPropsControllerDisableTrading` | Shared "stop trading" signal (read by patched SQX EAs) |
+| `HCPropsControllerHeartbeat` | Local controller liveness timestamp; removed on deinitialization |
 
 On startup the EA restores these values. If a daily reset time was missed while the EA was off, it performs the reset immediately. Set `ResetCountersOnInit = true` to wipe this state and start fresh.
 
@@ -513,7 +685,7 @@ The exit code is `1` if any file errored, `0` otherwise.
 A: Yes, but your EAs won't stop automatically when a limit is reached — only HCPropsController's own actions (closing positions, deleting pendings) apply.
 
 **Q: What happens when I hit a limit?**
-A: For equity limits and forced close, the EA closes all positions, deletes pending orders, and disables trading until the appropriate reset (daily, or `ResetCountersOnInit` for the sticky total lock). For count/streak/hours limits, it blocks new entries and removes pending orders but keeps open positions.
+A: For equity limits, the EA closes all positions, deletes pending orders, and disables trading until the appropriate reset (daily, or `ResetCountersOnInit` for the sticky total lock). A forced close blocks entries while liquidation is pending; after confirmed flat it leaves other active locks unchanged. Count and trading-hours limits block new entries and remove pending orders while keeping positions; streak limits also close positions as listed in the guardian table.
 
 **Q: Can I connect multiple SLAVE accounts to one MASTER?**
 A: Yes — as many Slaves as you want, all reading the same Master file. Give each Slave a unique `MagicNumber` within the same terminal.
@@ -569,4 +741,6 @@ If you run into issues:
 
 ---
 
-**Version:** 2.0
+**Version:** 2.52
+
+Native test scope and results for this version: [tests/RESULTS.md](tests/RESULTS.md).

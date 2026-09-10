@@ -1,0 +1,16 @@
+Mode=2
+PropFirmMode=true
+ForceInitialBalance=10000
+HistoryFromDate=0
+ResetCountersOnInit=false
+DailyProfitLimitPercent=0
+DailyLossLimitPercent=0
+TotalProfitLimitPercent=0
+TotalLossLimitPercent=0
+MaxLossPercentPerIdea=1.25
+MaxProfitPercentPerIdea=2.5
+MaxParallelTrades=0
+MaxTradesPerDay=0
+LimitTradingHours=false
+ForceExitEnabled=false
+NewsMode=0

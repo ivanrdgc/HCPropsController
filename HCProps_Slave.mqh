@@ -39,9 +39,18 @@ ulong g_mapMasterTicket[];
 // reopened while the Master processes the close request (the request stays in
 // our status file until the ticket leaves the Master file = the ack); pruned
 // when acked, or after 120 s (Master unreachable / propagation off there).
+// IDEA_LOSS/IDEA_PROFIT are the durable exception: explicit snapshot ack only.
 ulong    g_closedMasterTicket[];
 datetime g_closedMasterWhen[];
 string   g_closedMasterReason[];
+
+// Raw, validated inventory for durable idea-close acknowledgements (not filtered targets).
+ulong g_ideaMasterInventory[];
+bool g_ideaMasterInventoryValid = false;
+bool g_ideaHasTombstones = false;
+
+bool HCIdeaCloseReason(string reason)
+  { return reason == "IDEA_LOSS" || reason == "IDEA_PROFIT"; }
 
 // Per-ticket millisecond throttles (open retries, Master close retries, logs)
 ulong g_openTryTicket[];  ulong g_openTryWhenMs[];
@@ -150,6 +159,8 @@ void PruneClosedMasterTickets()
   {
    for(int i = ArraySize(g_closedMasterTicket) - 1; i >= 0; i--)
      {
+      if(HCIdeaCloseReason(g_closedMasterReason[i]))
+         continue; // durable idea requests are removed only by HCIdeaAckSlaveCloses
       bool inTargets = false;
       for(int t = 0; t < ArraySize(g_targets); t++)
          if(g_targets[t].masterTicket == g_closedMasterTicket[i])
@@ -170,8 +181,16 @@ void PruneClosedMasterTickets()
 
 void EnqueueMasterClose(ulong mTicket, string reason)
   {
-   if(mTicket == 0 || IsClosedMasterTicket(mTicket))
+   if(mTicket == 0)
       return;
+   for(int i = 0; i < ArraySize(g_closedMasterTicket); i++)
+      if(g_closedMasterTicket[i] == mTicket)
+        {
+         // Upgrade an existing ordinary request; never downgrade durable intent to TTL.
+         if(HCIdeaCloseReason(reason) && !HCIdeaCloseReason(g_closedMasterReason[i]))
+           { g_closedMasterReason[i] = reason; g_statusDirty = true; }
+         return;
+        }
    int n = ArraySize(g_closedMasterTicket);
    ArrayResize(g_closedMasterTicket, n + 1);
    ArrayResize(g_closedMasterWhen,   n + 1);
@@ -363,70 +382,121 @@ void PruneMapGVs()
   }
 
 //-------------------------------------------------------------------
-// Parse the Master file into 'out'.
-// Returns 0 = parsed new content, 1 = unchanged (same SEQ), 2 = torn/incomplete.
+// Strict wire numbers: StringToDouble alone accepts prefixes and maps junk to zero.
+bool HCSyncNumber(string text, double &value)
+  {
+   int n = StringLen(text), i = 0, digits = 0;
+   if(n == 0)
+      return false;
+   ushort c = StringGetCharacter(text, i);
+   if(c == '+' || c == '-')
+      i++;
+   while(i < n && StringGetCharacter(text, i) >= '0' && StringGetCharacter(text, i) <= '9')
+     { i++; digits++; }
+   if(i < n && StringGetCharacter(text, i) == '.')
+     {
+      i++;
+      while(i < n && StringGetCharacter(text, i) >= '0' && StringGetCharacter(text, i) <= '9')
+        { i++; digits++; }
+     }
+   if(digits == 0)
+      return false;
+   if(i < n && (StringGetCharacter(text, i) == 'e' || StringGetCharacter(text, i) == 'E'))
+     {
+      i++; digits = 0;
+      if(i < n && (StringGetCharacter(text, i) == '+' || StringGetCharacter(text, i) == '-'))
+         i++;
+      while(i < n && StringGetCharacter(text, i) >= '0' && StringGetCharacter(text, i) <= '9')
+        { i++; digits++; }
+      if(digits == 0)
+         return false;
+     }
+   if(i != n)
+      return false;
+   value = StringToDouble(text);
+   return MathIsValidNumber(value);
+  }
+
+bool HCSyncPositiveInteger(string text, long &value)
+  {
+   value = StringToInteger(text);
+   return value > 0 && text == IntegerToString(value);
+  }
+
+// Parse complete physical CSV lines, never borrowing fields from the next record.
+// Returns 0 = valid content, 1 = valid unchanged SEQ, 2 = malformed/incomplete.
+// The shipped v2 writer requires SEQ/END; unframed v2.00 peers must be upgraded.
 //-------------------------------------------------------------------
 int ParseMasterFile(int h, TargetPos &out[])
   {
    ArrayResize(out, 0);
-   bool  isSeq = false, gotEnd = false, first = true;
-   ulong seq = 0;
+   g_ideaMasterInventoryValid = false;
+   bool gotHeader = false, gotEnd = false;
+   ulong inventory[];
+   long seq = 0;
+   string masterCurrency = "";
 
    while(!FileIsEnding(h))
      {
-      string f1 = FileReadString(h);
-      if(StringLen(f1) == 0)
-         break;
-
-      if(first && f1 == "SEQ")
+      string fields[];
+      do
         {
-         first = false;
-         isSeq = true;
-         seq   = (ulong)StringToInteger(FileReadString(h));
-         string mcur = FileIsLineEnding(h) ? "" : FileReadString(h);
-         if(mcur != "")
-           {
-            g_masterCurrency = mcur;
-            string own = AccountInfoString(ACCOUNT_CURRENCY);
-            if(mcur != own && g_masterCurrencyWarned != mcur)
-              {
-               g_masterCurrencyWarned = mcur;
-               Print("SLAVE: WARNING Master account currency is ", mcur, " but this account uses ", own,
-                     " - AutoLotScaling compares raw tick values and may MIS-SCALE the lots!");
-              }
-           }
-         if(g_haveTargets && seq == g_lastSeqSeen)
-            return 1; // nothing new
+         int n = ArraySize(fields);
+         if(n >= 9)
+            return 2;
+         ArrayResize(fields, n + 1);
+         fields[n] = FileReadString(h);
+        }
+      while(!FileIsLineEnding(h) && !FileIsEnding(h));
+      int count = ArraySize(fields);
+      // FileIsEnding can lag until the read just after the final line terminator.
+      if(gotEnd && count == 1 && fields[0] == "" && FileIsEnding(h))
+         break;
+      if(gotEnd)
+         return 2; // no trailing records, delimiters or garbage after END
+
+      if(!gotHeader)
+        {
+         if((count != 2 && count != 3) || fields[0] != "SEQ" || !HCSyncPositiveInteger(fields[1], seq))
+            return 2;
+         if(count == 3)
+           { if(fields[2] == "") return 2; masterCurrency = fields[2]; }
+         gotHeader = true;
          continue;
         }
-      first = false;
 
-      if(f1 == "END")
+      if(fields[0] == "END")
         {
-         string s2 = FileIsLineEnding(h) ? "" : FileReadString(h);
-         gotEnd = !isSeq || ((ulong)StringToInteger(s2) == seq);
-         break;
+         long endSeq = 0;
+         if(count != 2 || !HCSyncPositiveInteger(fields[1], endSeq) || endSeq != seq)
+            return 2;
+         gotEnd = true;
+         continue;
         }
 
-      // ---- position record ----
-      string sSymbol = FileReadString(h);
-      string sType   = FileReadString(h);
-      string sVol    = FileReadString(h);
-      string sOpen   = FileReadString(h);   // Master entry: SL/TP distances are measured from here
-      string sSL     = FileReadString(h);
-      string sTP     = FileReadString(h);
-      string sTime   = FileReadString(h);   // openTime (informational)
-      string sPV     = FileIsLineEnding(h) ? "" : FileReadString(h); // v2: Master point value per lot
-
-      ulong  mTicket = (ulong)StringToInteger(f1);
-      int    mType   = (int)StringToInteger(sType);
-      double mVol    = StringToDouble(sVol);
-      double mEntry  = StringToDouble(sOpen);
-      double mSL     = StringToDouble(sSL);
-      double mTP     = StringToDouble(sTP);
-      double mPV     = StringToDouble(sPV);
-      if(mTicket == 0 || StringLen(sSymbol) == 0)
-         continue;
+      if(count != 9)
+         return 2;
+      string sSymbol = fields[1];
+      long ticket = 0, openTime = 0;
+      double mVol = 0, mEntry = 0, mSL = 0, mTP = 0, mPV = 0;
+      if(!HCSyncPositiveInteger(fields[0], ticket) || sSymbol == "" ||
+         (fields[2] != "0" && fields[2] != "1") ||
+         !HCSyncNumber(fields[3], mVol) || mVol <= 0.0 ||
+         !HCSyncNumber(fields[4], mEntry) || mEntry <= 0.0 ||
+         !HCSyncNumber(fields[5], mSL) || mSL < 0.0 ||
+         !HCSyncNumber(fields[6], mTP) || mTP < 0.0 ||
+         !HCSyncNumber(fields[8], mPV) || mPV < 0.0 ||
+         !HCSyncPositiveInteger(fields[7], openTime) || openTime > (long)D'3000.12.31 23:59:59')
+         return 2;
+      MqlDateTime dt;
+      if(!TimeToStruct((datetime)openTime, dt) || (long)StructToTime(dt) != openTime)
+         return 2; // writer uses integer epoch seconds, not formatted dates
+      ulong mTicket = (ulong)ticket;
+      int mType = (int)StringToInteger(fields[2]);
+      if(InUlongArray(inventory, mTicket))
+         return 2;
+      int ni = ArraySize(inventory);
+      ArrayResize(inventory, ni + 1); inventory[ni] = mTicket;
 
       // SL/TP as signed distances from the Master's entry (broker/slippage-independent).
       bool   hSL = (mSL != 0.0);
@@ -477,10 +547,27 @@ int ParseMasterFile(int h, TargetPos &out[])
       out[sz].matched   = false;
      }
 
-   if(isSeq && !gotEnd)
-      return 2; // Master was mid-write: discard, keep the previous state, retry next tick
-   if(isSeq)
-      g_lastSeqSeen = seq;
+   if(!gotHeader || !gotEnd)
+      return 2;
+   // Commit parser state only after validating the entire frame, even for same SEQ.
+   if(masterCurrency != "")
+     {
+      g_masterCurrency = masterCurrency;
+      string own = AccountInfoString(ACCOUNT_CURRENCY);
+      if(masterCurrency != own && g_masterCurrencyWarned != masterCurrency)
+        {
+         g_masterCurrencyWarned = masterCurrency;
+         Print("SLAVE: WARNING Master account currency is ", masterCurrency, " but this account uses ", own,
+               " - AutoLotScaling compares raw tick values and may MIS-SCALE the lots!");
+        }
+     }
+   g_ideaMasterInventoryValid = true;
+   ArrayResize(g_ideaMasterInventory, ArraySize(inventory));
+   ArrayCopy(g_ideaMasterInventory, inventory);
+   bool unchanged = g_haveTargets && (ulong)seq == g_lastSeqSeen && !g_ideaHasTombstones;
+   g_lastSeqSeen = (ulong)seq;
+   if(unchanged)
+      return 1;
    return 0;
   }
 
@@ -526,6 +613,8 @@ void SlaveSync()
    // opens/level-applies and keeps positions aligned at a 200 ms cadence.
    if(g_haveTargets)
      {
+      if(rc == 0 && g_ideaMasterInventoryValid)
+         HCIdeaAckSlaveCloses(g_ideaMasterInventory);
       PruneClosedMasterTickets(); // every tick, so the 120 s fallback works even if the file never changes
       ReconcileSlavePositions();
      }
@@ -552,6 +641,8 @@ void ReconcileSlavePositions()
          continue;
 
       ulong mt = MasterTicketOfPosition(pos); // comment, with GV backup
+      if(HCIdeaPositionLatched((ulong)pos.Identifier(), pos.PositionType()))
+         continue; // the idea guard owns close retries; sync must not bypass its backoff
       int   idx = -1;
       // 1) match by Master ticket
       if(mt != 0)
@@ -641,6 +732,8 @@ void ReconcileSlavePositions()
 
       // Closed here on purpose (own SL/TP/manual/lock): the Master is being asked
       // to close it; do NOT reopen.
+      if(HCIdeaIsTombstoned(g_targets[t].masterTicket))
+         continue; // also applies with propagation OFF and after restart / 120 seconds
       if(PropagateSlaveClose && IsClosedMasterTicket(g_targets[t].masterTicket))
          continue;
 
@@ -691,4 +784,3 @@ void ReconcileSlavePositions()
                        g_targets[t].slDist, g_targets[t].tpDist, g_targets[t].hasSL, g_targets[t].hasTP);
      }
   }
-
